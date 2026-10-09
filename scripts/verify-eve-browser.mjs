@@ -15,10 +15,12 @@ for (const dir of ['agent/lib', 'agent/tools', 'agent/channels', 'evals']) {
 }
 await symlink(join(root, 'node_modules'), join(fixture, 'node_modules'), 'dir');
 await writeFile(join(fixture, 'package.json'), JSON.stringify({ name: 'rove-eve-browser-fixture', type: 'module', dependencies: { eve: '^0.75.1' } }));
-for (const name of ['browser__navigate', 'browser__snapshot', 'inspect_page']) {
+for (const name of ['browser__interact', 'browser__navigate', 'browser__snapshot', 'inspect_page']) {
   await copyFile(join(root, `agent/tools/${name}.ts`), join(fixture, `agent/tools/${name}.ts`));
 }
-await copyFile(join(root, 'agent/lib/browser.ts'), join(fixture, 'agent/lib/browser.ts'));
+for (const name of ['browser', 'interactions', 'interaction-fixture']) {
+  await copyFile(join(root, `agent/lib/${name}.ts`), join(fixture, `agent/lib/${name}.ts`));
+}
 // Only this disposable copy substitutes URL validation, denying everything except the
 // exact ephemeral local fixture origin. The browser helper and tool definitions are unchanged.
 await writeFile(join(fixture, 'agent/lib/policy.ts'), `
@@ -53,23 +55,27 @@ await writeFile(join(fixture, 'production-discovery.json'), production.stdout);
 if (production.status !== 0) throw new Error(production.stderr || 'Production discovery failed');
 const productionInfo = JSON.parse(production.stdout);
 assert.equal(productionInfo.status, 'ready');
-assert.deepEqual(productionInfo.tools, ['browser__navigate', 'browser__snapshot', 'inspect_page']);
+assert.deepEqual(productionInfo.tools, ['browser__interact', 'browser__navigate', 'browser__snapshot', 'inspect_page']);
 const manifest = JSON.parse(await readFile(productionInfo.artifacts.compiledManifest, 'utf8'));
 for (const name of productionInfo.tools) {
   const binding = manifest.bindings[`tools/${name}.ts`];
   assert.equal(binding.owner.kind, 'application');
   assert.equal(binding.backing.sourcePath, join(root, `agent/tools/${name}.ts`));
   const schema = productionInfo.toolInputSchemas.root[name];
-  assert.deepEqual(Object.keys(schema.properties), ['url']);
-  assert.equal(schema.additionalProperties, false);
+  if (name === 'browser__interact') {
+    assert.equal(schema.oneOf?.length ?? schema.anyOf?.length, 5);
+  } else {
+    assert.deepEqual(Object.keys(schema.properties), ['url']);
+    assert.equal(schema.additionalProperties, false);
+  }
 }
-console.log('Production discovery: all three tools are application-owned and URL-only.');
+console.log('Production discovery: four application-owned tools; inspection URL-only, interactions fixture-only.');
 const discovery = run(['info', '--json']);
 await writeFile(join(fixture, 'discovery.json'), discovery.stdout);
 if (discovery.status !== 0) throw new Error(discovery.stderr || discovery.error?.message || 'Discovery failed');
 const info = JSON.parse(discovery.stdout);
 assert.equal(info.status, 'ready');
-assert.deepEqual(info.tools, ['browser__navigate', 'browser__snapshot', 'inspect_page']);
+assert.deepEqual(info.tools, ['browser__interact', 'browser__navigate', 'browser__snapshot', 'inspect_page']);
 console.log(JSON.stringify({ status: info.status, tools: info.tools, diagnostics: info.diagnostics }));
 const result = run(['eval', 'browser', '--json', '--timeout', '90000', '--max-concurrency', '1', '--skip-report']);
 await writeFile(join(fixture, 'eval-output.log'), result.stdout + result.stderr);
@@ -78,3 +84,5 @@ console.error(result.stderr);
 if (result.error) console.error(result.error.message);
 console.log(`Evidence retained at ${fixture}`);
 process.exitCode = result.status ?? 1;
+
+if (result.status === 0) console.log('Controlled Eve integration passed');
