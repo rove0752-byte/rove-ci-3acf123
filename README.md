@@ -65,9 +65,19 @@ node --experimental-strip-types scripts/verify-preview.mjs
 
 Public website extraction and credentialed AI runs are not verified in this environment. The production build and server startup pass; homepage and health endpoint both return HTTP 200. No money has been spent or domain purchased. Rove is a working name; brand availability has not been checked.
 
+## Read-only pilot rehearsal
+
+The only candidate page is `https://example.com/`. It is not approved for a live fetch. This prints a NO-GO plan: dedicated-container isolation, the existing 10s/20s/30s browser deadlines, a 1 MiB document cap, an evidence directory, and failure handling that closes the browser and does not report success. It does not open a socket.
+
+```sh
+node --experimental-strip-types scripts/readonly-pilot.ts
+```
+
+`--execute` exits with an error. The container policy still refuses a public address, so this command cannot reach the site. Host `npm start` and `eve dev` are outside that namespace and are not the pilot. Clicks, forms, authentication, purchases, customer access, deployment, and paid model calls stay off.
+
 ## Next milestone
 
-Configure a model credential in the intended runtime, then complete one public-website task end to end. Before offering customer access, enforce tenant isolation, infrastructure egress policy and ownership of run streams. Per-session page limits, token limits and the result schema are local controls. Customer billing is still absent.
+Approve the single candidate page and a reviewed TCP/443 container pin before any live fetch. A model credential is a separate later approval. Before offering customer access, enforce tenant isolation, infrastructure egress policy and ownership of run streams. Per-session page limits, token limits and the result schema are local controls. Customer billing is still absent.
 
 ## Phase 4A cloud foundation
 

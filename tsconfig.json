@@ -25,6 +25,7 @@
     "scripts/cloud-backup.ts",
     "scripts/cloud-smoke.ts",
     "scripts/container-egress-entry.ts",
-    "scripts/container-egress-probe.ts"
+    "scripts/container-egress-probe.ts",
+    "scripts/readonly-pilot.ts"
   ]
 }
