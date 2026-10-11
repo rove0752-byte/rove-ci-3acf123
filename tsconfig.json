@@ -26,6 +26,11 @@
     "scripts/cloud-smoke.ts",
     "scripts/container-egress-entry.ts",
     "scripts/container-egress-probe.ts",
+    "scripts/example-container.ts",
+    "scripts/example-pin-probe.ts",
+    "scripts/fetch-example-page.ts",
+    "scripts/verify-example-pin.ts",
+    "scripts/run-example-fetch.ts",
     "scripts/readonly-pilot.ts"
   ]
 }

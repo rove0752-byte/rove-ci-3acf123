@@ -1,16 +1,21 @@
 import { spawnSync } from 'node:child_process';
+import { lookup } from 'node:dns/promises';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, statSync, writeFileSync } from 'node:fs';
+import { isIP } from 'node:net';
 import {
   PUBLIC_BROWSER_PILOT_ENABLED,
   assertDedicatedContainerNetns,
   assertPrivatePidNamespace,
   assertPrivateSocketOwners,
   compileContainerEgress,
+  exampleReadProgram,
+  type ExampleReadPin,
   type LocalFixturePin,
   type NetnsInterface,
   type NetnsSocket,
   type PidRecord,
 } from '../agent/lib/container-egress.ts';
+import { publicAddress } from '../agent/lib/public-address.ts';
 
 // Applies the deny-all policy inside a dedicated container, then returns.
 // The launcher replaces this root process with an unprivileged agent before any browser starts.
@@ -34,6 +39,30 @@ function run(command: string, args: string[] = [], input?: string): string {
   if (result.error) refuse(`${command} failed: ${result.error.message}`);
   if (result.status !== 0) refuse(`${command} failed: ${result.stderr || result.stdout || result.status}`);
   return result.stdout;
+}
+
+async function resolveExampleRead(): Promise<(ExampleReadPin & { answers: string[] }) | null> {
+  const enabled = process.env.ROVE_EGRESS_EXAMPLE_READ === '1';
+  const host = process.env.ROVE_EGRESS_EXAMPLE_HOST;
+  if (!enabled) {
+    if (host) refuse('Public browser pilot is disabled.');
+    return null;
+  }
+  if (host !== 'example.com' || process.env.NODE_ENV === 'production' || !exampleReadProgram(process.env.ROVE_EGRESS_NEXT)) {
+    refuse('Public browser pilot is disabled.');
+  }
+  if (process.env.ROVE_EGRESS_LOCAL_FIXTURE === '1' || process.env.ROVE_EGRESS_FIXTURE_PINS) refuse('Public browser pilot is disabled.');
+  const answers = await Promise.race([
+    lookup('example.com', { all: true, verbatim: true }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('example.com did not resolve to a public address.')), 5_000)),
+  ]);
+  const publicAnswers = answers.map(item => item.address);
+  if (publicAnswers.length === 0 || publicAnswers.some(address => !publicAddress(address))) {
+    refuse('example.com did not resolve to a public address.');
+  }
+  const address = publicAnswers.find(item => isIP(item) === 4) ?? publicAnswers[0];
+  if (!address) refuse('example.com did not resolve to a public address.');
+  return { host: 'example.com', address, port: 443, answers: publicAnswers };
 }
 
 function fixturePins(): LocalFixturePin[] {
@@ -179,9 +208,13 @@ const sysctls = {
   ipv6Forward: lockSysctl('/proc/sys/net/ipv6/conf/all/forwarding', '0'),
 };
 
+const exampleRead = await resolveExampleRead();
 const pins = fixturePins();
+if (exampleRead && pins.length > 0) refuse('Public browser pilot is disabled.');
 const localFixture = pins.length > 0;
-const compiled = localFixture ? compileContainerEgress({ localFixture: true, pins }) : compileContainerEgress();
+const compiled = exampleRead
+  ? compileContainerEgress({ exampleRead })
+  : localFixture ? compileContainerEgress({ localFixture: true, pins }) : compileContainerEgress();
 let nftDockerDns: boolean | null = null;
 if (!prepareOnly) {
   run('iptables-restore', [], compiled.ipv4);
@@ -201,6 +234,7 @@ const saved = {
   pilot: 'off' as const,
   publicBrowserPilot: false,
   localFixture,
+  exampleRead,
   nftDockerDns,
   sysctls,
   ipv4: prepareOnly ? '' : run('iptables-save', []),

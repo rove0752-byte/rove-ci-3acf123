@@ -35,3 +35,4 @@ preview.png
 # Local scan dumps, screenshots, and copied binaries. The implementation checkpoint does not include them.
 /reports/phase4a/
 /reports/rove-trivy.json
+/reports/readonly-pilot/

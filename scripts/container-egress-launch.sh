@@ -8,6 +8,13 @@ case "$mode" in
   control) node --experimental-strip-types /app/scripts/container-egress-entry.ts --prepare-only ;;
   *) echo "Unsupported egress mode" >&2; exit 2 ;;
 esac
+next=${ROVE_EGRESS_NEXT:-probe}
+case "$next" in
+  probe) target=/app/scripts/container-egress-probe.ts ;;
+  example-pin) target=/app/scripts/example-pin-probe.ts ;;
+  example-fetch) target=/app/scripts/fetch-example-page.ts ;;
+  *) echo "Unsupported egress program" >&2; exit 2 ;;
+esac
 exec setpriv \
   --reuid=1000 \
   --regid=1000 \
@@ -16,4 +23,4 @@ exec setpriv \
   --ambient-caps=-all \
   --bounding-set=-all \
   -- \
-  node --experimental-strip-types /app/scripts/container-egress-probe.ts
+  node --experimental-strip-types "$target"

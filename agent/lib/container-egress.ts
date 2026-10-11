@@ -1,11 +1,13 @@
 // Default-drop policy for a dedicated container network namespace.
 // The public browser pilot stays off. Local fixture pins are a test-only TCP allow.
 import { isIP } from 'node:net';
+import { publicAddress } from './public-address.ts';
 
 export const PUBLIC_BROWSER_PILOT_ENABLED = false;
 
 export type ContainerEgressRules = { ipv4: string; ipv6: string };
 export type LocalFixturePin = { address: string; port: number };
+export type ExampleReadPin = { host: 'example.com'; address: string; port: 443 };
 export type NetnsInterface = {
   name: string;
   ifindex: number;
@@ -172,7 +174,7 @@ export function assertPrivateSocketOwners(pids: readonly PidRecord[], self: numb
 
 // DNS, QUIC, STUN and mDNS are rejected on every interface, including loopback,
 // before the loopback accept. Fixture pins are TCP/80 or TCP/443 only, after that accept.
-function render(family: 4 | 6, pins: readonly LocalFixturePin[]): string {
+function render(family: 4 | 6, pins: readonly LocalFixturePin[], label: 'fixture' | 'example' = 'fixture'): string {
   const lines = [
     '*filter',
     ':INPUT DROP [0:0]',
@@ -191,8 +193,9 @@ function render(family: 4 | 6, pins: readonly LocalFixturePin[]): string {
   for (const pin of pins) {
     if ((family === 4 && isIP(pin.address) !== 4) || (family === 6 && isIP(pin.address) !== 6)) continue;
     // ESTABLISHED only: a pin is not permission for the remote host to open a new connection.
-    lines.push(`-A INPUT -p tcp -s ${pin.address} --sport ${pin.port} -m conntrack --ctstate ESTABLISHED -m comment --comment rove-fixture-return -j ACCEPT`);
-    lines.push(`-A OUTPUT -p tcp -d ${pin.address} --dport ${pin.port} -m conntrack --ctstate NEW,ESTABLISHED -m comment --comment rove-fixture-pin -j ACCEPT`);
+    const comment = label === 'example' ? 'rove-example' : 'rove-fixture';
+    lines.push(`-A INPUT -p tcp -s ${pin.address} --sport ${pin.port} -m conntrack --ctstate ESTABLISHED -m comment --comment ${comment}-return -j ACCEPT`);
+    lines.push(`-A OUTPUT -p tcp -d ${pin.address} --dport ${pin.port} -m conntrack --ctstate NEW,ESTABLISHED -m comment --comment ${comment}-pin -j ACCEPT`);
   }
   lines.push(
     reject(family, 'tcp', 'rove-deny-tcp'),
@@ -228,8 +231,33 @@ function render(family: 4 | 6, pins: readonly LocalFixturePin[]): string {
   return lines.join('\n');
 }
 
-export function compileContainerEgress(options: { pins?: readonly LocalFixturePin[]; localFixture?: boolean } = {}): ContainerEgressRules {
+export function exampleReadProgram(next: string | undefined): next is 'example-fetch' | 'example-pin' {
+  return next === 'example-fetch' || next === 'example-pin';
+}
+
+export function validateExampleReadPin(pin: { host?: string; address?: string; port?: number } | undefined): ExampleReadPin {
+  if (PUBLIC_BROWSER_PILOT_ENABLED || process.env.NODE_ENV === 'production' || !pin) throw new Error(PILOT_DISABLED);
+  if (pin.host !== 'example.com' || pin.port !== 443 || typeof pin.address !== 'string' || !publicAddress(pin.address)) {
+    throw new Error(PILOT_DISABLED);
+  }
+  return { host: 'example.com', address: pin.address, port: 443 };
+}
+
+export function compileContainerEgress(options: {
+  pins?: readonly LocalFixturePin[];
+  localFixture?: boolean;
+  exampleRead?: { host?: string; address?: string; port?: number };
+} = {}): ContainerEgressRules {
   if (PUBLIC_BROWSER_PILOT_ENABLED) throw new Error(PILOT_DISABLED);
+  if (options.exampleRead && options.localFixture) throw new Error(PILOT_DISABLED);
+  if (options.exampleRead) {
+    const pin = validateExampleReadPin(options.exampleRead);
+    const pins = [pin];
+    return {
+      ipv4: render(4, pins.filter(item => isIP(item.address) === 4), 'example'),
+      ipv6: render(6, pins.filter(item => isIP(item.address) === 6), 'example'),
+    };
+  }
   const requested = options.pins ?? [];
   if (requested.length > 0 && options.localFixture !== true) throw new Error(PILOT_DISABLED);
   const pins = options.localFixture === true ? validateLocalFixturePins(requested) : [];

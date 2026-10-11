@@ -6,7 +6,9 @@ import {
   assertPrivatePidNamespace,
   assertPrivateSocketOwners,
   compileContainerEgress,
+  exampleReadProgram,
   externalAccepts,
+  validateExampleReadPin,
   type NetnsInterface,
 } from '../agent/lib/container-egress.ts';
 
@@ -70,6 +72,56 @@ test('local fixture pins allow only private TCP/80 and TCP/443', () => {
     assert.match(rules.ipv6, /fdcc:10::10/);
     assert.equal(rules.ipv4.includes('fdcc:10::10'), false);
     assert.equal(externalAccepts(rules.ipv4).some(line => line.includes('RELATED')), false);
+  } finally {
+    if (previous === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previous;
+  }
+});
+
+test('example.com read pin allows one public TCP/443 address and nothing else', () => {
+  const previous = process.env.NODE_ENV;
+  delete process.env.NODE_ENV;
+  try {
+    assert.equal(exampleReadProgram('example-fetch'), true);
+    assert.equal(exampleReadProgram('example-pin'), true);
+    assert.equal(exampleReadProgram(undefined), false);
+    assert.equal(exampleReadProgram('probe'), false);
+    const pin = validateExampleReadPin({ host: 'example.com', address: '203.0.113.10', port: 443 });
+    assert.deepEqual(pin, { host: 'example.com', address: '203.0.113.10', port: 443 });
+    const rules = compileContainerEgress({ exampleRead: pin });
+    const lines = rules.ipv4.split('\n');
+    const quic = lines.findIndex(line => line.includes('rove-deny-quic'));
+    const loopback = lines.findIndex(line => line.includes('-o lo -j ACCEPT'));
+    const allow = lines.findIndex(line => line.includes('rove-example-pin'));
+    assert.ok(quic >= 0 && quic < loopback && loopback < allow);
+    const accepts = externalAccepts(rules.ipv4);
+    assert.equal(accepts.length, 2);
+    assert.ok(accepts.every(line => line.includes('203.0.113.10') && line.includes('-p tcp') && line.includes('443') && line.includes('ESTABLISHED')));
+    assert.equal(accepts.some(line => line.includes('RELATED') || line.includes('-p udp')), false);
+    assert.match(rules.ipv4, /rove-raw-deny-quic/);
+    assert.match(rules.ipv4, /rove-deny-dns/);
+    assert.match(rules.ipv4, /rove-deny-icmp/);
+    assert.equal(externalAccepts(rules.ipv6).length, 0);
+    assert.equal(rules.ipv6.includes('203.0.113.10'), false);
+    const v6 = compileContainerEgress({ exampleRead: { host: 'example.com', address: '2606:4700:4700::1111', port: 443 } });
+    assert.equal(externalAccepts(v6.ipv4).length, 0);
+    assert.equal(externalAccepts(v6.ipv6).length, 2);
+    assert.throws(() => compileContainerEgress({
+      localFixture: true,
+      pins: [{ address: '10.0.0.8', port: 443 }],
+      exampleRead: pin,
+    }), /Public browser pilot is disabled/);
+    for (const candidate of [
+      { host: 'www.example.com', address: '203.0.113.10', port: 443 },
+      { host: 'example.com', address: '203.0.113.10', port: 80 },
+      { host: 'example.com', address: '10.1.1.1', port: 443 },
+      { host: 'example.com', address: '2001:db8::10', port: 443 },
+      { host: 'example.com', address: '2001:0db8::10', port: 443 },
+      { host: 'example.com', address: '2001:0000::1', port: 443 },
+      { host: 'example.com', address: '2001:0002::1', port: 443 },
+    ]) assert.throws(() => validateExampleReadPin(candidate), /Public browser pilot is disabled/);
+    process.env.NODE_ENV = 'production';
+    assert.throws(() => validateExampleReadPin(pin), /Public browser pilot is disabled/);
   } finally {
     if (previous === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = previous;
