@@ -13,6 +13,8 @@ case "$next" in
   probe) target=/app/scripts/container-egress-probe.ts ;;
   example-pin) target=/app/scripts/example-pin-probe.ts ;;
   example-fetch) target=/app/scripts/fetch-example-page.ts ;;
+  structured-pin) target=/app/scripts/structured-pin-probe.ts ;;
+  structured-fetch) target=/app/scripts/fetch-structured-page.ts ;;
   *) echo "Unsupported egress program" >&2; exit 2 ;;
 esac
 exec setpriv \

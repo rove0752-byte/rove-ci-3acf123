@@ -11,6 +11,7 @@ type Policy = {
   publicBrowserPilot: boolean;
   localFixture: boolean;
   exampleRead: { host: string; address: string; port: number; answers: string[] } | null;
+  structuredRead?: unknown;
   ipv4: string;
   ipv6: string;
 };
@@ -28,7 +29,7 @@ const policy = JSON.parse(readFileSync('/run/rove/egress-policy.json', 'utf8')) 
 const pin = policy.exampleRead;
 const rules = `${policy.ipv4}\n${policy.ipv6}`;
 const accepts = externalAccepts(rules);
-if (!policy.enforced || policy.pilot !== 'off' || policy.publicBrowserPilot || policy.localFixture || !pin ||
+if (!policy.enforced || policy.pilot !== 'off' || policy.publicBrowserPilot || policy.localFixture || policy.structuredRead || !pin ||
   pin.host !== 'example.com' || pin.port !== 443 || !publicAddress(pin.address) ||
   accepts.length !== 2 || accepts.some(line => !line.includes(pin.address) || !line.includes('-p tcp') || !line.includes('443'))) {
   event('policy', 'violation', 'pin');

@@ -65,19 +65,29 @@ node --experimental-strip-types scripts/verify-preview.mjs
 
 Public website extraction and credentialed AI runs are not verified in this environment. The production build and server startup pass; homepage and health endpoint both return HTTP 200. No money has been spent or domain purchased. Rove is a working name; brand availability has not been checked.
 
-## Read-only pilot rehearsal
+## Read-only pilot
 
-The only candidate page is `https://example.com/`. It is not approved for a live fetch. This prints a NO-GO plan: dedicated-container isolation, the existing 10s/20s/30s browser deadlines, a 1 MiB document cap, an evidence directory, and failure handling that closes the browser and does not report success. It does not open a socket.
+One local container read of `https://example.com/` completed. It pinned one resolved public address on TCP/443 and recorded the HTTP status, title, text, timing, and evidence. That read does not authorize another fetch. The rehearsal still prints NO-GO and does not open a socket:
 
 ```sh
 node --experimental-strip-types scripts/readonly-pilot.ts
 ```
 
-`--execute` exits with an error. The container policy still refuses a public address, so this command cannot reach the site. Host `npm start` and `eve dev` are outside that namespace and are not the pilot. Clicks, forms, authentication, purchases, customer access, deployment, and paid model calls stay off.
+`--execute` exits with an error. `PUBLIC_BROWSER_PILOT_ENABLED` stays false. Host `npm start` and `eve dev` are outside that namespace and are not the pilot. Clicks, forms, authentication, purchases, customer access, deployment, and paid model calls stay off.
+
+## Structured pilot
+
+The second read-only candidate is `https://docs.python.org/3/`. It would catalog the title, headings, links, and metadata of that one document, then compare the catalog with an independent reading of the same document. The candidate stays NO-GO and does not open a document socket:
+
+```sh
+node --experimental-strip-types scripts/structured-pilot.ts --url https://docs.python.org/3/
+```
+
+`--execute` exits with an error. A container program can pin one current public address for `docs.python.org` on TCP/443. The only document program requests `https://docs.python.org/3/` once, with that pin, and does not follow another URL. The example.com pin is not an allowlist for this host. Clicks, forms, authentication, purchases, customer access, deployment, and paid model calls stay off.
 
 ## Next milestone
 
-Approve the single candidate page and a reviewed TCP/443 container pin before any live fetch. A model credential is a separate later approval. Before offering customer access, enforce tenant isolation, infrastructure egress policy and ownership of run streams. Per-session page limits, token limits and the result schema are local controls. Customer billing is still absent.
+One read-only GET of `https://docs.python.org/3/` has completed through the reviewed docs.python.org TCP/443 pin. It does not authorize another page, another host, or another request. A model credential is a separate later approval. Before offering customer access, enforce tenant isolation, infrastructure egress policy and ownership of run streams. Per-session page limits, token limits and the result schema are local controls. Customer billing is still absent.
 
 ## Phase 4A cloud foundation
 

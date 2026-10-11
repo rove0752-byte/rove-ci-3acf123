@@ -8,9 +8,14 @@ import {
   compileContainerEgress,
   exampleReadProgram,
   externalAccepts,
+  selectStructuredPin,
+  structuredReadProgram,
   validateExampleReadPin,
+  validateStructuredReadPin,
   type NetnsInterface,
 } from '../agent/lib/container-egress.ts';
+import { readFileSync } from 'node:fs';
+import { publicAddress } from '../agent/lib/public-address.ts';
 
 const dedicated: NetnsInterface[] = [
   { name: 'lo', ifindex: 1, iflink: 1, up: true, ipv4: ['127.0.0.1'], ipv6: ['::1'] },
@@ -213,4 +218,69 @@ test('dedicated network check refuses host devices, extra loopback, and foreign 
   assert.throws(() => assertPrivatePidNamespace([{ pid: 1, ppid: 0 }, { pid: 7, ppid: 1 }, { pid: 9, ppid: 1 }], 7), /dedicated container/);
   assert.doesNotThrow(() => assertPrivateSocketOwners([{ pid: 1, ppid: 0 }, { pid: 7, ppid: 1 }, { pid: 8, ppid: 7 }], 7, [8]));
   assert.throws(() => assertPrivateSocketOwners([{ pid: 1, ppid: 0 }, { pid: 7, ppid: 1 }], 7, [1]), /dedicated container/);
+});
+
+test('docs.python.org read pin allows one public TCP/443 address and one /3/ command', () => {
+  const previous = process.env.NODE_ENV;
+  delete process.env.NODE_ENV;
+  try {
+    assert.equal(structuredReadProgram('structured-pin'), true);
+    assert.equal(structuredReadProgram('structured-fetch'), true);
+    assert.equal(structuredReadProgram('structured-get'), false);
+    assert.equal(structuredReadProgram('example-fetch'), false);
+    assert.equal(selectStructuredPin(['151.101.0.223', '151.101.128.223'], '151.101.128.223'), '151.101.128.223');
+    assert.equal(exampleReadProgram('structured-pin'), false);
+    for (const address of ['151.101.0.223', '151.101.64.223', '151.101.128.223', '151.101.192.223', '2a04:4e42::223']) {
+      assert.equal(publicAddress(address), true);
+    }
+    const pin = validateStructuredReadPin({ host: 'docs.python.org', address: '151.101.0.223', port: 443 });
+    assert.deepEqual(pin, { host: 'docs.python.org', address: '151.101.0.223', port: 443 });
+    const rules = compileContainerEgress({ structuredRead: pin });
+    const lines = rules.ipv4.split('\n');
+    const quic = lines.findIndex(line => line.includes('rove-deny-quic'));
+    const loopback = lines.findIndex(line => line.includes('-o lo -j ACCEPT'));
+    const allow = lines.findIndex(line => line.includes('rove-structured-pin'));
+    assert.ok(quic >= 0 && quic < loopback && loopback < allow);
+    const accepts = externalAccepts(rules.ipv4);
+    assert.equal(accepts.length, 2);
+    assert.ok(accepts.every(line => line.includes('151.101.0.223') && line.includes('-p tcp') && line.includes('443') && line.includes('ESTABLISHED')));
+    assert.equal(accepts.some(line => line.includes('RELATED') || line.includes('-p udp') || line.includes('rove-example')), false);
+    for (const other of ['151.101.64.223', '151.101.128.223', '151.101.192.223', '1.1.1.1']) {
+      assert.equal(rules.ipv4.includes(other), false);
+    }
+    assert.match(rules.ipv4, /rove-raw-deny-quic/);
+    assert.match(rules.ipv4, /rove-deny-dns/);
+    assert.match(rules.ipv4, /rove-deny-icmp/);
+    assert.equal(externalAccepts(rules.ipv6).length, 0);
+    const v6 = compileContainerEgress({ structuredRead: { host: 'docs.python.org', address: '2a04:4e42::223', port: 443 } });
+    assert.equal(externalAccepts(v6.ipv4).length, 0);
+    assert.equal(externalAccepts(v6.ipv6).length, 2);
+    assert.equal(v6.ipv6.includes('2a04:4e42:200::223'), false);
+    const example = validateExampleReadPin({ host: 'example.com', address: '203.0.113.10', port: 443 });
+    assert.throws(() => compileContainerEgress({ structuredRead: pin, exampleRead: example }), /Public browser pilot is disabled/);
+    assert.throws(() => compileContainerEgress({
+      structuredRead: pin,
+      localFixture: true,
+      pins: [{ address: '10.0.0.8', port: 443 }],
+    }), /Public browser pilot is disabled/);
+    assert.throws(() => compileContainerEgress({ structuredRead: pin, pins: [{ address: '151.101.64.223', port: 443 }] }), /Public browser pilot is disabled/);
+    for (const candidate of [
+      { host: 'python.org', address: '151.101.0.223', port: 443 },
+      { host: 'www.python.org', address: '151.101.0.223', port: 443 },
+      { host: 'docs.python.org', address: '151.101.0.223', port: 80 },
+      { host: 'docs.python.org', address: '10.1.1.1', port: 443 },
+      { host: 'docs.python.org', address: '2001:db8::10', port: 443 },
+      { host: 'example.com', address: '151.101.0.223', port: 443 },
+    ]) assert.throws(() => validateStructuredReadPin(candidate), /Public browser pilot is disabled/);
+    process.env.NODE_ENV = 'production';
+    assert.throws(() => validateStructuredReadPin(pin), /Public browser pilot is disabled/);
+    const launch = readFileSync(new URL('../scripts/container-egress-launch.sh', import.meta.url), 'utf8');
+    const probe = readFileSync(new URL('../scripts/structured-pin-probe.ts', import.meta.url), 'utf8');
+    assert.equal(launch.includes('structured-pin)'), true);
+    assert.equal(launch.includes('structured-fetch)'), true);
+    assert.equal(/from 'node:https'|http\.request|method:\s*'GET'/.test(probe), false);
+  } finally {
+    if (previous === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previous;
+  }
 });

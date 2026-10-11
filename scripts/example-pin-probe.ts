@@ -13,13 +13,14 @@ type Policy = {
   publicBrowserPilot: boolean;
   localFixture: boolean;
   exampleRead: { host: string; address: string; port: number; answers: string[] } | null;
+  structuredRead?: unknown;
   ipv4: string;
   ipv6: string;
 };
 
 const policy = JSON.parse(readFileSync('/run/rove/egress-policy.json', 'utf8')) as Policy;
 const pin = policy.exampleRead;
-if (!policy.enforced || policy.pilot !== 'off' || policy.publicBrowserPilot || policy.localFixture || !pin) {
+if (!policy.enforced || policy.pilot !== 'off' || policy.publicBrowserPilot || policy.localFixture || policy.structuredRead || !pin) {
   throw new Error('Example read pin was not installed.');
 }
 if (pin.host !== 'example.com' || pin.port !== 443 || !publicAddress(pin.address)) {

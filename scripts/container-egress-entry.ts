@@ -9,8 +9,11 @@ import {
   assertPrivateSocketOwners,
   compileContainerEgress,
   exampleReadProgram,
+  selectStructuredPin,
+  structuredReadProgram,
   type ExampleReadPin,
   type LocalFixturePin,
+  type StructuredReadPin,
   type NetnsInterface,
   type NetnsSocket,
   type PidRecord,
@@ -52,6 +55,7 @@ async function resolveExampleRead(): Promise<(ExampleReadPin & { answers: string
     refuse('Public browser pilot is disabled.');
   }
   if (process.env.ROVE_EGRESS_LOCAL_FIXTURE === '1' || process.env.ROVE_EGRESS_FIXTURE_PINS) refuse('Public browser pilot is disabled.');
+  if (process.env.ROVE_EGRESS_STRUCTURED_READ === '1' || process.env.ROVE_EGRESS_STRUCTURED_HOST) refuse('Public browser pilot is disabled.');
   const answers = await Promise.race([
     lookup('example.com', { all: true, verbatim: true }),
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error('example.com did not resolve to a public address.')), 5_000)),
@@ -63,6 +67,35 @@ async function resolveExampleRead(): Promise<(ExampleReadPin & { answers: string
   const address = publicAnswers.find(item => isIP(item) === 4) ?? publicAnswers[0];
   if (!address) refuse('example.com did not resolve to a public address.');
   return { host: 'example.com', address, port: 443, answers: publicAnswers };
+}
+
+async function resolveStructuredRead(): Promise<(StructuredReadPin & { answers: string[] }) | null> {
+  const enabled = process.env.ROVE_EGRESS_STRUCTURED_READ === '1';
+  const host = process.env.ROVE_EGRESS_STRUCTURED_HOST;
+  if (!enabled) {
+    if (host) refuse('Public browser pilot is disabled.');
+    return null;
+  }
+  if (host !== 'docs.python.org' || process.env.NODE_ENV === 'production' || !structuredReadProgram(process.env.ROVE_EGRESS_NEXT)) {
+    refuse('Public browser pilot is disabled.');
+  }
+  if (process.env.ROVE_EGRESS_EXAMPLE_READ === '1' || process.env.ROVE_EGRESS_EXAMPLE_HOST) refuse('Public browser pilot is disabled.');
+  if (process.env.ROVE_EGRESS_LOCAL_FIXTURE === '1' || process.env.ROVE_EGRESS_FIXTURE_PINS) refuse('Public browser pilot is disabled.');
+  const answers = await Promise.race([
+    lookup('docs.python.org', { all: true, verbatim: true }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('docs.python.org did not resolve to a public address.')), 5_000)),
+  ]);
+  const publicAnswers = answers.map(item => item.address);
+  const expected = process.env.ROVE_STRUCTURED_PIN_ADDRESS;
+  if (expected && process.env.ROVE_EGRESS_NEXT !== 'structured-fetch') refuse('Public browser pilot is disabled.');
+  if (process.env.ROVE_EGRESS_NEXT === 'structured-fetch' && !expected) refuse('Public browser pilot is disabled.');
+  let address: string;
+  try {
+    address = selectStructuredPin(publicAnswers, process.env.ROVE_EGRESS_NEXT === 'structured-fetch' ? expected : undefined);
+  } catch (error) {
+    refuse(error instanceof Error ? error.message : 'docs.python.org did not resolve to a public address.');
+  }
+  return { host: 'docs.python.org', address, port: 443, answers: publicAnswers };
 }
 
 function fixturePins(): LocalFixturePin[] {
@@ -209,12 +242,15 @@ const sysctls = {
 };
 
 const exampleRead = await resolveExampleRead();
+const structuredRead = await resolveStructuredRead();
 const pins = fixturePins();
-if (exampleRead && pins.length > 0) refuse('Public browser pilot is disabled.');
+if ([exampleRead, structuredRead, pins.length > 0].filter(Boolean).length > 1) refuse('Public browser pilot is disabled.');
 const localFixture = pins.length > 0;
 const compiled = exampleRead
   ? compileContainerEgress({ exampleRead })
-  : localFixture ? compileContainerEgress({ localFixture: true, pins }) : compileContainerEgress();
+  : structuredRead
+    ? compileContainerEgress({ structuredRead })
+    : localFixture ? compileContainerEgress({ localFixture: true, pins }) : compileContainerEgress();
 let nftDockerDns: boolean | null = null;
 if (!prepareOnly) {
   run('iptables-restore', [], compiled.ipv4);
@@ -235,6 +271,7 @@ const saved = {
   publicBrowserPilot: false,
   localFixture,
   exampleRead,
+  structuredRead,
   nftDockerDns,
   sysctls,
   ipv4: prepareOnly ? '' : run('iptables-save', []),
