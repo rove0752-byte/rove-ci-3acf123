@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {createHash} from 'node:crypto';
+import {execFileSync} from 'node:child_process';
+const excluded='scripts/audit-phase3-boundary.ts';
+assert.equal(createHash('sha256').update(readFileSync('docs/GATES-phase3-historical.md')).digest('hex'),'46489d5f6b06178e023ddb5b91ea15861859671a8bcc07d5b39035a5614007aa');
+assert.equal(createHash('sha256').update(readFileSync(excluded)).digest('hex'),'04684a6150017512ed57bda0acc61d09b140a2e3b97dd60f1f555aa4e761b102');
+assert.equal(execFileSync('git',['check-ignore',excluded],{encoding:'utf8'}).trim(),excluded);
+const intended=readFileSync('docs/PHASE-4A-COMMIT-FILES.txt','utf8').trim().split('\n');
+assert(!intended.includes(excluded));assert.equal(new Set(intended).size,intended.length);
+const staged=execFileSync('git',['diff','--cached','--name-only','-z'],{encoding:'utf8'}).split('\0').filter(Boolean);
+for(const path of staged)assert(intended.includes(path),`Unrelated staged path: ${path}`);
+const changed=execFileSync('git',['ls-files','--modified','--others','--exclude-standard','-z'],{encoding:'utf8'}).split('\0').filter(Boolean);
+for(const path of changed)assert(intended.includes(path),`Unclassified change: ${path}`);
+for(const path of intended)readFileSync(path);
+console.log(`Phase 4 commit scope passed: ${intended.length} intended files; ${staged.length} staged; original Phase 3 diagnostic preserved and ignored`);

@@ -1,0 +1,7 @@
+FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
+RUN apt-get -o Acquire::http::Timeout=20 -o Acquire::Retries=1 update && apt-get -o Acquire::http::Timeout=20 -o Acquire::Retries=1 install -y --no-install-recommends g++ binutils && rm -rf /var/lib/apt/lists/*
+COPY aligned-new.cpp /src/aligned-new.cpp
+RUN mkdir /out && g++ -std=c++17 -O0 /src/aligned-new.cpp -ldl -o /out/aligned-new
+COPY resolver.c /src/resolver.c
+RUN gcc /src/resolver.c -lresolv -o /out/resolver
+CMD ["node"]

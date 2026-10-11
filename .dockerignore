@@ -1,0 +1,13 @@
+# Allowlist: historical evidence, experiments, Eve, browser code and secrets never enter build context.
+**
+!Dockerfile.cloud
+!deploy/
+!deploy/cloud/
+!deploy/cloud/package.json
+!deploy/cloud/package-lock.json
+!cloud/
+!cloud/*.ts
+!public/
+!public/cloud.html
+!public/cloud.js
+!public/cloud.css

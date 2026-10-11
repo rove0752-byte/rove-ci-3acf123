@@ -28,3 +28,10 @@ preview.png
 .unlazy/
 .unlazy-hook-state.json
 .claude/settings.local.json
+
+# Preserve the local historical diagnostic without including it in the Phase 4 commit.
+/scripts/audit-phase3-boundary.ts
+
+# Local scan dumps, screenshots, and copied binaries. The implementation checkpoint does not include them.
+/reports/phase4a/
+/reports/rove-trivy.json

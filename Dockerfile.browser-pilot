@@ -1,0 +1,21 @@
+# Local egress-proof image only. railway.json selects Dockerfile.cloud. Do not deploy or publish this image.
+FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
+USER root
+RUN apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=2 update \
+  && apt-get install -y --no-install-recommends iptables iproute2 libcap2-bin iputils-ping procps ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/egress
+RUN npm init -y \
+  && npm install --omit=dev --ignore-scripts --no-audit --no-fund --fetch-timeout=30000 --fetch-retries=2 playwright@1.64.0
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+  NODE_PATH=/opt/egress/node_modules \
+  HOME=/tmp
+RUN npx playwright install --with-deps chromium \
+  && chmod -R a+rX /ms-playwright \
+  && mkdir -p /app/scripts /app/agent /run/rove /evidence \
+  && chown 1000:1000 /evidence /tmp
+# nft is separate from iptables so Docker's native docker-dns table can be removed without rebuilding Chromium.
+RUN apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=2 update \
+  && apt-get install -y --no-install-recommends nftables \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app

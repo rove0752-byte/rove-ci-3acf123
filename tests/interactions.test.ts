@@ -11,6 +11,9 @@ test('controlled fixture: permitted actions, state, isolation and cleanup', asyn
     const first = await tools.run('alice', { action: 'start' });
     assert.ok('accessibility' in first);
     assert.equal(first.title, 'Rove controlled fixture');
+    assert.match(first.screenshotSha256, /^[a-f0-9]{64}$/);
+    assert.equal(first.screenshotBytes, Buffer.from(first.screenshotBase64, 'base64').length);
+    assert.ok(first.screenshotBytes > 100);
     const sessionId = first.sessionId;
     const typed = await tools.run('alice', { action: 'type', sessionId, role: 'textbox', name: 'Draft note', text: 'Retained draft' });
     assert.ok('accessibility' in typed && typed.accessibility.includes('Retained draft'));
@@ -76,6 +79,9 @@ test('input surface rejects scripts, URLs, uploads, keypresses and unbounded tex
     { action: 'start', url: 'https://example.com' }, { action: 'evaluate', script: 'alert(1)' },
     { action: 'upload', path: '/tmp/file' }, { action: 'download' }, { action: 'press', key: 'Enter' },
     { action: 'type', sessionId: '7b963bb2-6b01-49c7-b56f-2bf22f58b423', role: 'textbox', name: 'Draft note', text: 'x'.repeat(1001) },
+    { action: 'navigate', sessionId: '7b963bb2-6b01-49c7-b56f-2bf22f58b423', url: 'x'.repeat(2049) },
+    { action: 'select', sessionId: '7b963bb2-6b01-49c7-b56f-2bf22f58b423', role: 'combobox', name: 'Sort by', option: '' },
+    { action: 'purchase', sessionId: 'not-a-uuid' },
   ]) assert.equal(interactionInput.safeParse(input).success, false);
 });
 
@@ -133,7 +139,8 @@ test('an action deadline closes the session even when Playwright work stalls', a
     fill: () => { stalled = true; return new Promise(() => {}); },
   };
   const page = { on() {}, goto: async () => {}, title: async () => 'fixture',
-    url: () => 'https://rove-fixture.invalid/', locator: () => locator, getByRole: () => locator };
+    url: () => 'https://rove-fixture.invalid/', locator: () => locator, getByRole: () => locator,
+    screenshot: async () => Buffer.from('png') };
   const context = { setDefaultTimeout() {}, routeWebSocket: async () => {}, newPage: async () => page,
     on() {}, route: async () => {} };
   const tools = createInteractionTools({ operationMs: 30, launch: async () => ({
@@ -145,4 +152,37 @@ test('an action deadline closes the session even when Playwright work stalls', a
   assert.equal(stalled, true);
   assert.equal(closed, true);
   await assert.rejects(tools.run('owner', { action: 'snapshot', sessionId: start.sessionId }), /Unknown/);
+});
+
+test('fixture select and preview navigation capture evidence and refuse live targets', async () => {
+  const browser = await launchBrowser();
+  const tools = createInteractionTools({ launch: async () => new Proxy(browser, { get(target, key) {
+    if (key === 'close') return async () => { await Promise.all(target.contexts().map(context => context.close())); };
+    const value = Reflect.get(target, key);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } }) });
+  try {
+    const start = await tools.run('owner', { action: 'start' });
+    const page = browser.contexts()[0].pages()[0];
+    const urls: string[] = [];
+    page.on('framenavigated', frame => { if (frame === page.mainFrame()) urls.push(frame.url()); });
+    const selected = await tools.run('owner', { action: 'select', sessionId: start.sessionId, role: 'combobox', name: 'Sort by', option: 'Name' });
+    assert.equal('selection' in selected ? selected.selection : undefined, 'Name');
+    assert.match(selected.screenshotSha256, /^[a-f0-9]{64}$/);
+    assert.equal(selected.screenshotBytes, Buffer.from(selected.screenshotBase64, 'base64').length);
+    const preview = await tools.run('owner', { action: 'navigate', sessionId: start.sessionId, url: 'https://rove-fixture.invalid/preview' });
+    assert.equal(preview.title, 'Rove fixture preview');
+    assert.equal(preview.url, 'https://rove-fixture.invalid/preview');
+    assert.equal(preview.effect, 'local-navigation');
+    assert.ok(preview.evidenceId);
+    await assert.rejects(tools.run('owner', { action: 'purchase', sessionId: start.sessionId }), /Live side effects/);
+    assert.ok(urls.every(url => url.startsWith('https://rove-fixture.invalid/')));
+    assert.equal(urls.includes('https://example.com/next'), false);
+    const again = await tools.run('owner', { action: 'start' });
+    const nextPage = browser.contexts()[0].pages()[0];
+    const nextUrls: string[] = [];
+    nextPage.on('framenavigated', frame => { if (frame === nextPage.mainFrame()) nextUrls.push(frame.url()); });
+    await assert.rejects(tools.run('owner', { action: 'navigate', sessionId: again.sessionId, url: 'https://example.com/next' }), /Live side effects/);
+    assert.deepEqual(nextUrls, []);
+  } finally { await tools.closeAll(); await browser.close(); }
 });

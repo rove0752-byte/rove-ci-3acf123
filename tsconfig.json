@@ -15,6 +15,16 @@
   },
   "include": [
     "agent/**/*.ts",
-    "evals/**/*.ts"
+    "evals/**/*.ts",
+    "cloud/**/*.ts",
+    "tests/cloud.test.ts",
+    "tests/result-schema.test.ts",
+    "tests/helpers/**/*.ts",
+    "scripts/verify-cloud-dashboard.ts",
+    "scripts/verify-cloud-dashboard-container.ts",
+    "scripts/cloud-backup.ts",
+    "scripts/cloud-smoke.ts",
+    "scripts/container-egress-entry.ts",
+    "scripts/container-egress-probe.ts"
   ]
 }

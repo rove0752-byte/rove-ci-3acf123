@@ -1,0 +1,19 @@
+# Phase 4A candidate; residual-risk review is required before deployment.
+FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS dependencies
+WORKDIR /app
+COPY deploy/cloud/package.json deploy/cloud/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund --fetch-timeout=30000 --fetch-retries=1
+
+FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:9eeb7f5887d0e239e78264b06f7f11d2e14be534050481803a9e4728fcdd278e
+WORKDIR /app
+# Root-only DNS search avoids CVE-2026-8674; database startup rejects overrides.
+ENV LOCALDOMAIN=. NODE_ENV=production ROVE_BIND=0.0.0.0 PORT=4320 NODE_OPTIONS=--max-old-space-size=192
+COPY --from=dependencies /app/package.json /app/package-lock.json ./
+COPY --from=dependencies /app/node_modules ./node_modules
+COPY cloud ./cloud
+COPY public/cloud.html public/cloud.js public/cloud.css ./public/
+USER 1000:1000
+EXPOSE 4320
+ENTRYPOINT ["/nodejs/bin/node"]
+CMD ["--experimental-strip-types", "cloud/server.ts"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:'+process.env.PORT+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]

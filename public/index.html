@@ -7,7 +7,8 @@ Content-Type: application/json
 {
   "url": "https://example.com",
   "task": "Summarise this page with sources",
-  "outputFormat": "JSON"
+  "outputFormat": "JSON",
+  "outputSchema": { "type": "object", "required": ["title"], "properties": { "title": { "type": "string" } } }
 }</pre></details></section><section class="card"><div class="topline">RESULTS & EVIDENCE</div><h2 id="title">Your first run starts here.</h2><p id="message">Run a task to view the answer and evidence. Inspect page returns text, links and a screenshot without using AI.</p><pre id="output" hidden></pre><img id="shot" hidden alt="Captured page screenshot"></section></div></main><script>
 const $=id=>document.getElementById(id);const headers=()=>({'Content-Type':'application/json',...($('key').value?{Authorization:'Bearer '+$('key').value}:{})});
 async function health(){try{const r=await fetch('/v1/health',{headers:headers()});const d=await r.json();$('health').textContent=d.error||`Browser: ${d.browserInstalled?'ready':'installation required'} · AI: ${d.aiConfigured?'configured':'credential required'}`;}catch{$('health').textContent='Could not check setup.';}}$('key').addEventListener('change',health);health();

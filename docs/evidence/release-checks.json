@@ -1,0 +1,89 @@
+{
+  "date": "2026-10-10",
+  "branch": "phase-4-cloud-foundation",
+  "cwd": "/Users/jacksontaylor/rove",
+  "shell": "/bin/zsh",
+  "checks": {
+    "typecheck": {
+      "exit": 0,
+      "status": "PASS",
+      "log": "/tmp/rove-release-typecheck.log",
+      "sha256": "bf89bb99283a44a33bd1eea363914fbbe40d3943ebfb516733111d643f91570f"
+    },
+    "cloud": {
+      "exit": 0,
+      "status": "PASS",
+      "log": "/tmp/rove-release-tests.log",
+      "sha256": "861f094b9ff1b571cfb26a35dfca81f74ccfd149bba33458e72ca9aec9722bef"
+    },
+    "regression": {
+      "exit": 0,
+      "status": "PASS",
+      "log": "/tmp/rove-release-all-tests.log",
+      "sha256": "bce015c1098c6e91e71afc1995e5d0567de1e278f28fa38fe7500a3645302d65"
+    },
+    "dashboard": {
+      "exit": 0,
+      "status": "PASS",
+      "log": "/tmp/rove-release-dashboard.log",
+      "sha256": "6fb5f4d64679d05c68cecbe3288a4e39d63d2d33615072e9b97e3d152d6000a9"
+    },
+    "build": {
+      "exit": 0,
+      "status": "PASS",
+      "log": "/tmp/rove-release-build.log",
+      "sha256": "23255de3a623c3aa1afa980382d4b88f037d706bc869fb86130d456b0df3d066"
+    },
+    "imageInventory": {
+      "exit": 0,
+      "status": "PASS",
+      "log": "/tmp/rove-release-image.log",
+      "sha256": "6d01cba8a70cc2d4d390aa14757556e5fa8f329b790dc6cc4b6501ff4986dcee"
+    },
+    "container": {
+      "exit": 0,
+      "status": "PASS",
+      "log": "/tmp/rove-release-container.log",
+      "sha256": "d51b1b4cb3487b4913fde3a5fb9eb4390aa766af84e8c6d481e38f0fd72564f6"
+    },
+    "scan": {
+      "exit": 1,
+      "status": "BLOCKED",
+      "log": "/tmp/rove-release-scout.log",
+      "sha256": "2c001c9e305b9e10d4c148fcb26fd9fbf78348ec332da009355ca43b400dc561",
+      "reason": "Docker Scout requires Docker login; no SARIF report produced. Trivy/Grype not installed."
+    },
+    "commitScope": {
+      "exit": 0,
+      "status": "PASS",
+      "log": "/tmp/rove-release-scope.log",
+      "sha256": "99e79ce5e66658cd394e80f8cd586fed32d9575edaeece3ee02a6a18e63cea38"
+    }
+  },
+  "scope": {
+    "intendedFiles": 48,
+    "stagedFiles": 0,
+    "excludedPreservedDiagnostic": "scripts/audit-phase3-boundary.ts"
+  },
+  "audit": {
+    "root": {
+      "moderate": 5,
+      "high": 0,
+      "critical": 0,
+      "status": "FAIL"
+    },
+    "cloud": {
+      "total": 0,
+      "status": "PASS"
+    }
+  },
+  "container": {
+    "imageBytes": 83403227,
+    "memorySampleMiB": 43.04,
+    "limitMiB": 512,
+    "cpuSamplePercent": 0.79,
+    "cpuLimit": 1
+  },
+  "hostedEvidence": false,
+  "exceptionApproved": false
+}

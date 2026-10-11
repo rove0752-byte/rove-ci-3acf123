@@ -18,7 +18,7 @@ await writeFile(join(fixture, 'package.json'), JSON.stringify({ name: 'rove-eve-
 for (const name of ['browser__interact', 'browser__navigate', 'browser__snapshot', 'inspect_page']) {
   await copyFile(join(root, `agent/tools/${name}.ts`), join(fixture, `agent/tools/${name}.ts`));
 }
-for (const name of ['browser', 'interactions', 'interaction-fixture']) {
+for (const name of ['browser', 'browser-guard', 'egress-proxy', 'interactions', 'interaction-fixture', 'public-address', 'action-contract']) {
   await copyFile(join(root, `agent/lib/${name}.ts`), join(fixture, `agent/lib/${name}.ts`));
 }
 // Only this disposable copy substitutes URL validation, denying everything except the
@@ -63,7 +63,7 @@ for (const name of productionInfo.tools) {
   assert.equal(binding.backing.sourcePath, join(root, `agent/tools/${name}.ts`));
   const schema = productionInfo.toolInputSchemas.root[name];
   if (name === 'browser__interact') {
-    assert.equal(schema.oneOf?.length ?? schema.anyOf?.length, 5);
+    assert.equal(schema.oneOf?.length ?? schema.anyOf?.length, 11);
   } else {
     assert.deepEqual(Object.keys(schema.properties), ['url']);
     assert.equal(schema.additionalProperties, false);

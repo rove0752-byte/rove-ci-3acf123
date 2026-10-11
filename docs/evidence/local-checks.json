@@ -1,0 +1,69 @@
+{
+  "date": "2026-10-10",
+  "checks": {
+    "typecheck": {
+      "sha256": "bf89bb99283a44a33bd1eea363914fbbe40d3943ebfb516733111d643f91570f",
+      "log": "/tmp/rove-trial-typecheck.log",
+      "exit": 0,
+      "environment": "local; /Users/jacksontaylor/rove; /bin/zsh; host Node 24.9.0"
+    },
+    "cloud": {
+      "sha256": "06f29eabe830cfb65cc279a5aa1dfa88bbeaa525ce0b1a3736774e5be0e7da01",
+      "log": "/tmp/rove-trial-cloud.log",
+      "exit": 0,
+      "environment": "local; /Users/jacksontaylor/rove; /bin/zsh; host Node 24.9.0"
+    },
+    "dashboard": {
+      "sha256": "6fb5f4d64679d05c68cecbe3288a4e39d63d2d33615072e9b97e3d152d6000a9",
+      "log": "/tmp/rove-trial-dashboard.log",
+      "exit": 0,
+      "environment": "local; /Users/jacksontaylor/rove; /bin/zsh; host Node 24.9.0"
+    },
+    "regression": {
+      "sha256": "cadeac85499a8a86a970d998ddec69d97d3e157a05d20089f5529675a9284abd",
+      "log": "/tmp/rove-trial-tests.log",
+      "exit": 0,
+      "environment": "local; /Users/jacksontaylor/rove; /bin/zsh; host Node 24.9.0"
+    },
+    "eve": {
+      "sha256": "75ff0093b5796fdf26d2b40728fb8b3840fc4c2bafbe361348627be224dcc30f",
+      "log": "/tmp/rove-trial-eve.log",
+      "exit": 0,
+      "environment": "local; /Users/jacksontaylor/rove; /bin/zsh; host Node 24.9.0"
+    },
+    "package": {
+      "sha256": "18b76f0112cecd7911d519697d5300f2d0dc29bc69567bf9f80847229475fc2d",
+      "log": "/tmp/rove-trial-package.log",
+      "exit": 0,
+      "environment": "local; /Users/jacksontaylor/rove; /bin/zsh; host Node 24.9.0"
+    },
+    "docker": {
+      "sha256": "edff734d6f4ac59355138d45ebd1b2dfc38ac615db9a0071bacefa2ae4c338c1",
+      "log": "/tmp/rove-trial-docker-final.log",
+      "exit": 0,
+      "environment": "local; /Users/jacksontaylor/rove; /bin/zsh; host Node 24.9.0"
+    },
+    "container": {
+      "sha256": "c9b79c661657f8ae543d5136a8a4794e5c317c5735f93077dafa0247395da95b",
+      "log": "/tmp/rove-trial-container.log",
+      "exit": 0,
+      "environment": "local; /Users/jacksontaylor/rove; /bin/zsh; host Node 24.9.0"
+    }
+  },
+  "limitations": [
+    "PGlite and disposable PostgreSQL 17 are local, not Supabase",
+    "Container fixture uses fake credentials, no published ports, NODE_ENV=development and TLS disabled only over loopback",
+    "Dashboard and Eve use local fixtures",
+    "Hosted TLS, pooler, grants, usage and restore remain unverified",
+    "No OS/base-image vulnerability scan performed",
+    "No deployment or provisioning performed"
+  ],
+  "containerSample": {
+    "imageBytes": 83403034,
+    "memoryMiB": 43.18,
+    "limitMiB": 512,
+    "cpuPercent": 0.42,
+    "cpuLimit": 1,
+    "sustainedLoadTest": false
+  }
+}

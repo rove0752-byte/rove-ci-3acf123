@@ -14,7 +14,12 @@
     "start": "eve start",
     "typecheck": "tsc",
     "preview": "node --experimental-strip-types scripts/preview.ts",
-    "test": "node --experimental-strip-types --test tests/*.test.ts"
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:schema": "node --experimental-strip-types scripts/verify-eve-output-schema.mjs",
+    "cloud:start": "node --experimental-strip-types cloud/server.ts",
+    "cloud:worker": "node --experimental-strip-types cloud/run-worker.ts",
+    "test:cloud": "node --experimental-strip-types --test tests/cloud.test.ts",
+    "test:dashboard": "node --experimental-strip-types scripts/verify-cloud-dashboard.ts"
   },
   "dependencies": {
     "@agent-browser/eve": "^0.38.2",
@@ -23,9 +28,11 @@
     "ai": "^7.0.128",
     "eve": "^0.75.1",
     "playwright": "^1.64.0",
+    "postgres": "3.4.7",
     "zod": "4.5.4"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.3.14",
     "@types/node": "24.x",
     "just-bash": "^3.6.0",
     "microsandbox": "^0.5.5",
@@ -33,5 +40,10 @@
   },
   "engines": {
     "node": "24.x"
+  },
+  "overrides": {
+    "guarded-fetch": {
+      "undici": "7.29.1"
+    }
   }
 }
