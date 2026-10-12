@@ -7,7 +7,7 @@ export type DocumentMetadata = {
   robots: string;
   ogTitle: string;
 };
-export type CompletenessReason = 'link-cap' | 'heading-cap' | 'section-skipped' | 'text-cap' | 'overlong-link' | 'timeout';
+export type CompletenessReason = 'link-cap' | 'heading-cap' | 'section-skipped' | 'text-cap' | 'overlong-link' | 'jsonld-cap' | 'table-cap' | 'timeout';
 export type TimeoutStage = 'deadline' | 'navigation' | 'fetch' | 'catalog';
 export type ExtractionCompleteness = {
   complete: boolean;
@@ -20,6 +20,13 @@ export type ExtractionCompleteness = {
   overlongLinks: number;
   timedOut: boolean;
   timeoutStage: TimeoutStage | null;
+  // Present on browser inspect. Catalog pages do not extract JSON-LD or tables.
+  jsonLdKept?: number;
+  jsonLdOmitted?: number;
+  rowsKept?: number;
+  rowsOmitted?: number;
+  cellsKept?: number;
+  cellsOmitted?: number;
 };
 export type DocumentCatalog = {
   title: string;
@@ -72,6 +79,12 @@ export function buildCompleteness(counts: {
   overlongLinks: number;
   timedOut?: boolean;
   timeoutStage?: TimeoutStage | null;
+  jsonLdKept?: number;
+  jsonLdOmitted?: number;
+  rowsKept?: number;
+  rowsOmitted?: number;
+  cellsKept?: number;
+  cellsOmitted?: number;
 }): ExtractionCompleteness {
   const reasons: CompletenessReason[] = [];
   if (counts.linksOmitted > 0) reasons.push('link-cap');
@@ -79,9 +92,11 @@ export function buildCompleteness(counts: {
   if (counts.sectionsSkipped > 0) reasons.push('section-skipped');
   if (counts.textCapped) reasons.push('text-cap');
   if (counts.overlongLinks > 0) reasons.push('overlong-link');
+  if ((counts.jsonLdOmitted ?? 0) > 0) reasons.push('jsonld-cap');
+  if ((counts.rowsOmitted ?? 0) > 0 || (counts.cellsOmitted ?? 0) > 0) reasons.push('table-cap');
   const timedOut = counts.timedOut === true;
   if (timedOut) reasons.push('timeout');
-  return {
+  const completeness: ExtractionCompleteness = {
     complete: reasons.length === 0,
     reasons,
     headingsKept: counts.headingsKept,
@@ -93,6 +108,16 @@ export function buildCompleteness(counts: {
     timedOut,
     timeoutStage: timedOut ? (counts.timeoutStage ?? 'catalog') : null,
   };
+  // Catalog callers omit these counts so their completeness object stays unchanged.
+  if (counts.jsonLdOmitted !== undefined || counts.rowsOmitted !== undefined || counts.cellsOmitted !== undefined) {
+    completeness.jsonLdKept = counts.jsonLdKept ?? 0;
+    completeness.jsonLdOmitted = counts.jsonLdOmitted ?? 0;
+    completeness.rowsKept = counts.rowsKept ?? 0;
+    completeness.rowsOmitted = counts.rowsOmitted ?? 0;
+    completeness.cellsKept = counts.cellsKept ?? 0;
+    completeness.cellsOmitted = counts.cellsOmitted ?? 0;
+  }
+  return completeness;
 }
 
 const NAMED_ENTITIES: Record<string, string> = {
@@ -464,6 +489,8 @@ function countsMatch(catalog: DocumentCatalog): boolean {
   if (completeness.sectionsSkipped > 0) expected.push('section-skipped');
   if (completeness.reasons.includes('text-cap')) expected.push('text-cap');
   if (completeness.overlongLinks > 0) expected.push('overlong-link');
+  if ((completeness.jsonLdOmitted ?? 0) > 0) expected.push('jsonld-cap');
+  if ((completeness.rowsOmitted ?? 0) > 0 || (completeness.cellsOmitted ?? 0) > 0) expected.push('table-cap');
   if (completeness.timedOut) expected.push('timeout');
   const sameReasons = completeness.reasons.length === expected.length
     && completeness.reasons.every((reason, index) => reason === expected[index]);

@@ -10,16 +10,21 @@ import { mandatoryChromiumArgs, startIsolatedNetwork, type IsolatedDocument, typ
 import { publicAddress } from './public-address.ts';
 import { validateUrl } from './policy.ts';
 
+export type TimeoutCause = TimeoutStage | 'snapshot' | 'screenshot';
+
 export class ExtractionTimeout extends Error {
   readonly complete = false;
   readonly failed = true;
   readonly reason = 'timeout';
   readonly timedOut = true;
   readonly stage: TimeoutStage;
-  constructor(stage: TimeoutStage) {
+  // Distinguishes a per-operation cap from the visit deadline. Stage values stay the same.
+  readonly cause: TimeoutCause;
+  constructor(stage: TimeoutStage, cause?: TimeoutCause) {
     super(`Browser operation timed out during ${stage}.`);
     this.name = 'ExtractionTimeout';
     this.stage = stage;
+    this.cause = cause ?? stage;
   }
 }
 
@@ -136,20 +141,27 @@ export function createBrowserTools(dependencies: {
     return Math.min(limit, remaining);
   }
 
-  function deadlineFailure(error: unknown, budget: ExtractionBudget): unknown {
+  function deadlineFailure(error: unknown, budget: ExtractionBudget, cause?: 'snapshot' | 'screenshot'): unknown {
     if (error instanceof ExtractionTimeout) return error;
-    if (budget.signal.aborted || Date.now() >= budget.deadlineAt) return new ExtractionTimeout('deadline');
-    if (error instanceof Error && /timeout|timed out/i.test(error.message)) return new ExtractionTimeout('deadline');
+    if (budget.signal.aborted || Date.now() >= budget.deadlineAt) return new ExtractionTimeout('deadline', 'deadline');
+    if (error instanceof Error && /timeout|timed out/i.test(error.message)) return new ExtractionTimeout('deadline', cause ?? 'deadline');
     return error;
   }
 
-  async function withinDeadline<T>(budget: ExtractionBudget, run: () => Promise<T>): Promise<T> {
-    if (budget.signal.aborted || budget.deadlineAt - Date.now() < 1) throw new ExtractionTimeout('deadline');
+  async function withinDeadline<T>(budget: ExtractionBudget, run: () => Promise<T>, cause?: 'snapshot' | 'screenshot'): Promise<T> {
+    if (budget.signal.aborted || budget.deadlineAt - Date.now() < 1) throw new ExtractionTimeout('deadline', 'deadline');
     try {
       return await run();
     } catch (error) {
-      throw deadlineFailure(error, budget);
+      throw deadlineFailure(error, budget, cause);
     }
+  }
+
+  async function captureScreenshot(page: Page, budget: ExtractionBudget) {
+    // One shot. The 5000ms cap stays, and it cannot outlive the visit deadline or use timeout 0.
+    return withinDeadline(budget, () => page.screenshot({
+      type: 'png', timeout: allowedTimeout(budget, 5000), signal: budget.signal,
+    }), 'screenshot');
   }
 
   async function visit<T>(raw: string, capture: (page: Page, status: number, budget: ExtractionBudget) => Promise<T>): Promise<T> {
@@ -277,24 +289,7 @@ export function createBrowserTools(dependencies: {
         }
         return { links, linksOmitted, overlongLinks, textCapped };
       }, bounds);
-      const catalog = await page.locator('html').evaluate((_root, bounds) => {
-        const clean = (value: string | null | undefined, max: number) => {
-          const text = (value ?? '').replace(/\s+/g, ' ').trim();
-          return { text: text.slice(0, max), capped: text.length > max };
-        };
-        const description = clean(document.querySelector('meta[name="description" i]')?.getAttribute('content'), bounds.metaLimit);
-        const cell = (value: string | null | undefined) => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
-        const tables = [...document.querySelectorAll('table')].slice(0, 5).map(table =>
-          [...table.querySelectorAll('tr')].slice(0, 20).map(row =>
-            [...row.querySelectorAll('th, td')].slice(0, 10).map(item => cell(item.textContent))));
-        const jsonLd: unknown[] = [];
-        for (const node of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0, 5)) {
-          const raw = (node.textContent ?? '').trim();
-          if (!raw || raw.length > 20_000) continue;
-          try { jsonLd.push(JSON.parse(raw)); } catch { /* Invalid JSON-LD is data, not code, and is omitted. */ }
-        }
-        return { description: description.text, tables, jsonLd, textCapped: description.capped };
-      }, bounds);
+      const catalog = await page.locator('html').evaluate(collectStructures as never, bounds) as ReturnType<typeof collectStructures>;
       const links = extracted.links;
       const headed = extractNavigationHeadings(await page.content());
       const listed = await inventory(page, status, budget);
@@ -308,8 +303,14 @@ export function createBrowserTools(dependencies: {
         textCapped,
         overlongLinks: extracted.overlongLinks,
         timedOut: false,
+        jsonLdKept: catalog.jsonLdKept,
+        jsonLdOmitted: catalog.jsonLdOmitted,
+        rowsKept: catalog.rowsKept,
+        rowsOmitted: catalog.rowsOmitted,
+        cellsKept: catalog.cellsKept,
+        cellsOmitted: catalog.cellsOmitted,
       });
-      const screenshot = await page.screenshot({ type: 'png', timeout: 5000 });
+      const screenshot = await captureScreenshot(page, budget);
       const title = await page.title();
       return { evidenceId: randomUUID(), url: page.url(), title, httpStatus: status,
         capturedAt: new Date().toISOString(), text: content.slice(0, 18_000), truncated: content.length > 18_000,
@@ -344,7 +345,7 @@ export function createBrowserTools(dependencies: {
         // The 1000ms snapshot cap and the 5000ms action cap stay, and neither can outlive the visit deadline.
         const accessibility = await withinDeadline(budget, () => element.ariaSnapshot({
           timeout: allowedTimeout(budget, 1000), signal: budget.signal,
-        }));
+        }), 'snapshot');
         const disabled = await withinDeadline(budget, () => element.isDisabled({
           timeout: allowedTimeout(budget, 5000), signal: budget.signal,
         }));
@@ -365,7 +366,7 @@ export function createBrowserTools(dependencies: {
   function snapshotPage(raw: string) {
     return visit(raw, async (page, status, budget) => {
       const details = await inventory(page, status, budget);
-      const screenshot = await page.screenshot({ type: 'png', timeout: 5000 });
+      const screenshot = await captureScreenshot(page, budget);
       return { ...details, screenshotBase64: screenshot.toString('base64'),
         screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), screenshotBytes: screenshot.length };
     });
@@ -376,6 +377,76 @@ export function createBrowserTools(dependencies: {
 export function omitScreenshot(output: object) {
   const { screenshotBase64: _image, ...evidence } = output as { screenshotBase64?: string };
   return evidence;
+}
+
+interface StructureRoot {
+  textContent: string | null;
+  getAttribute(name: string): string | null;
+  querySelector(selector: string): StructureRoot | null;
+  querySelectorAll(selector: string): ArrayLike<StructureRoot> & Iterable<StructureRoot>;
+}
+
+// Runs in the page. Limits stay 20,000 characters, 5 blocks, 5 tables, 20 rows, and 10 cells.
+export function collectStructures(root: StructureRoot, bounds: { metaLimit: number }) {
+  const clean = (value: string | null | undefined, max: number) => {
+    const text = (value ?? '').replace(/\s+/g, ' ').trim();
+    return { text: text.slice(0, max), capped: text.length > max };
+  };
+  const cellText = (value: string | null | undefined) => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  const description = clean(root.querySelector('meta[name="description" i]')?.getAttribute('content'), bounds.metaLimit);
+  const tables: string[][][] = [];
+  let rowsKept = 0;
+  let rowsOmitted = 0;
+  let cellsKept = 0;
+  let cellsOmitted = 0;
+  const tableNodes = [...root.querySelectorAll('table')];
+  for (let tableIndex = 0; tableIndex < tableNodes.length; tableIndex += 1) {
+    const table = tableNodes[tableIndex];
+    if (!table) continue;
+    const rowNodes = [...table.querySelectorAll('tr')];
+    if (tableIndex >= 5) {
+      rowsOmitted += rowNodes.length;
+      for (const row of rowNodes) cellsOmitted += [...row.querySelectorAll('th, td')].length;
+      continue;
+    }
+    const keptRows: string[][] = [];
+    for (let rowIndex = 0; rowIndex < rowNodes.length; rowIndex += 1) {
+      const row = rowNodes[rowIndex];
+      if (!row) continue;
+      const cellNodes = [...row.querySelectorAll('th, td')];
+      if (rowIndex >= 20) {
+        rowsOmitted += 1;
+        cellsOmitted += cellNodes.length;
+        continue;
+      }
+      rowsKept += 1;
+      const keptCells: string[] = [];
+      for (let cellIndex = 0; cellIndex < cellNodes.length; cellIndex += 1) {
+        const cell = cellNodes[cellIndex];
+        if (!cell) continue;
+        if (cellIndex >= 10) { cellsOmitted += 1; continue; }
+        cellsKept += 1;
+        keptCells.push(cellText(cell.textContent));
+      }
+      keptRows.push(keptCells);
+    }
+    tables.push(keptRows);
+  }
+  const jsonLd: unknown[] = [];
+  let jsonLdOmitted = 0;
+  for (const node of [...root.querySelectorAll('script[type="application/ld+json"]')]) {
+    const raw = (node.textContent ?? '').trim();
+    if (!raw) continue;
+    if (raw.length > 20_000) { jsonLdOmitted += 1; continue; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { continue; }
+    if (jsonLd.length >= 5) { jsonLdOmitted += 1; continue; }
+    jsonLd.push(parsed);
+  }
+  return {
+    description: description.text, tables, jsonLd, textCapped: description.capped,
+    jsonLdKept: jsonLd.length, jsonLdOmitted, rowsKept, rowsOmitted, cellsKept, cellsOmitted,
+  };
 }
 
 export const { inspectPage, navigate, snapshotPage } = createBrowserTools();

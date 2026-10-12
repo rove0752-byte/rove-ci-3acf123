@@ -399,7 +399,7 @@ test('public address selection rejects private DNS answers and keeps accepted li
 test('accessibility inspection finishes inside the extraction deadline', async () => {
   let snapshots = 0;
   const seen: { timeout: number; aborted: boolean }[] = [];
-  const { tools } = accessibilityTools({
+  const { tools, screenshots } = accessibilityTools({
     buttons: [
       { visible: true, disabled: false, label: 'Go' },
       { visible: false, disabled: false, label: 'Hidden control' },
@@ -411,6 +411,10 @@ test('accessibility inspection finishes inside the extraction deadline', async (
   assert.equal(seen.length, 1);
   assert.ok(seen[0] && seen[0].timeout >= 1 && seen[0].timeout <= 1000);
   assert.equal(seen[0]?.aborted, false);
+  assert.equal(screenshots.length, 1);
+  assert.equal(screenshots[0]?.timeout, 5000);
+  assert.equal(screenshots[0]?.aborted, false);
+  assert.equal(screenshots[0]?.signaled, true);
   assert.equal(result.completeness.complete, true);
   assert.equal(result.completeness.timedOut, false);
   assert.equal(result.truncated, false);
@@ -438,6 +442,7 @@ test('an ariaSnapshot timeout is a structured deadline failure', async () => {
     assert.equal(error.reason, 'timeout');
     assert.equal(error.timedOut, true);
     assert.equal(error.stage, 'deadline');
+    assert.equal(error.cause, 'snapshot');
     assert.match(error.message, /timed out/);
     return true;
   });
@@ -466,6 +471,7 @@ test('accessibility inspection does not start another snapshot after the deadlin
     await assert.rejects(tools.inspectPage('http://127.0.0.1/a11y'), (error: unknown) => {
       assert.ok(error instanceof ExtractionTimeout);
       assert.equal(error.stage, 'deadline');
+      assert.equal(error.cause, 'deadline');
       assert.equal(error.complete, false);
       assert.equal(error.failed, true);
       assert.equal(error.timedOut, true);
@@ -479,6 +485,92 @@ test('accessibility inspection does not start another snapshot after the deadlin
     assert.equal(unhandled.length, 0);
   } finally {
     process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('a screenshot timeout is one structured failure', async () => {
+  const { tools, screenshots } = accessibilityTools({
+    buttons: [{ visible: true, disabled: false, label: 'Go' }],
+    screenshotFail: new Error('Timeout 5000ms exceeded.'),
+  });
+  await assert.rejects(tools.inspectPage('http://127.0.0.1/a11y'), (error: unknown) => {
+    assert.ok(error instanceof ExtractionTimeout);
+    assert.equal(error.cause, 'screenshot');
+    assert.equal(error.stage, 'deadline');
+    assert.equal(error.complete, false);
+    assert.equal(error.failed, true);
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.timedOut, true);
+    assert.match(error.message, /timed out/);
+    return true;
+  });
+  assert.equal(screenshots.length, 1);
+  assert.equal(screenshots[0]?.timeout, 5000);
+  assert.equal(screenshots[0]?.aborted, false);
+  assert.equal(screenshots[0]?.signaled, true);
+});
+
+test('a snapshot screenshot timeout is one structured failure', async () => {
+  const { tools, screenshots } = accessibilityTools({
+    buttons: [],
+    screenshotFail: new Error('Timeout 5000ms exceeded.'),
+  });
+  await assert.rejects(tools.snapshotPage('http://127.0.0.1/a11y'), (error: unknown) => {
+    assert.ok(error instanceof ExtractionTimeout);
+    assert.equal(error.cause, 'screenshot');
+    assert.equal(error.stage, 'deadline');
+    assert.equal(error.complete, false);
+    assert.equal(error.failed, true);
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.timedOut, true);
+    assert.match(error.message, /timed out/);
+    return true;
+  });
+  assert.equal(screenshots.length, 1);
+  assert.ok(screenshots[0] && screenshots[0].timeout >= 1 && screenshots[0].timeout <= 5000);
+  assert.equal(screenshots[0]?.signaled, true);
+});
+
+test('a screenshot that outlives the visit deadline stays a deadline failure', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown) => { unhandled.push(error); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const { tools, screenshots } = accessibilityTools({
+      timeoutMs: 800,
+      buttons: [{ visible: true, disabled: false, label: 'Go' }],
+      screenshotWaitForAbort: true,
+    });
+    await assert.rejects(tools.inspectPage('http://127.0.0.1/a11y'), (error: unknown) => {
+      assert.ok(error instanceof ExtractionTimeout);
+      assert.equal(error.cause, 'deadline');
+      assert.equal(error.stage, 'deadline');
+      assert.equal(error.complete, false);
+      assert.equal(error.failed, true);
+      assert.equal(error.reason, 'timeout');
+      assert.equal(error.timedOut, true);
+      assert.match(error.message, /timed out/);
+      return true;
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(screenshots.length, 1);
+    assert.ok(screenshots[0] && screenshots[0].timeout >= 1 && screenshots[0].timeout < 5000);
+    assert.equal(screenshots[0]?.signaled, true);
+    assert.equal(unhandled.length, 0);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('extraction timeout cause defaults to the existing stage', () => {
+  for (const stage of ['deadline', 'navigation', 'fetch', 'catalog'] as const) {
+    const error = new ExtractionTimeout(stage);
+    assert.equal(error.stage, stage);
+    assert.equal(error.cause, stage);
+    assert.equal(error.complete, false);
+    assert.equal(error.failed, true);
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.timedOut, true);
   }
 });
 
@@ -497,19 +589,42 @@ function accessibilityTools(options: {
   onScreenshot?: () => void;
   onVisible?: () => void;
   onDisabled?: () => void;
+  screenshotFail?: Error;
+  screenshotWaitForAbort?: boolean;
+  structureRoot?: unknown;
 }) {
+  const screenshots: { timeout: number; aborted: boolean; signaled: boolean }[] = [];
   const page = {
     on() {},
     url: () => 'http://127.0.0.1/a11y',
     async goto() { return { status: () => 200 }; },
     async title() { return 'Deadline fixture'; },
     async content() { return '<title>Deadline fixture</title><h1>Hello</h1>'; },
-    async screenshot() { options.onScreenshot?.(); return Buffer.from('png'); },
+    async screenshot(args?: { timeout?: number; signal?: AbortSignal }) {
+      const call = { timeout: args?.timeout ?? 0, aborted: args?.signal?.aborted === true, signaled: args?.signal instanceof AbortSignal };
+      screenshots.push(call);
+      options.onScreenshot?.();
+      if (options.screenshotFail) throw options.screenshotFail;
+      if (options.screenshotWaitForAbort) {
+        await new Promise((resolve, reject) => {
+          const signal = args?.signal;
+          const safety = setTimeout(() => reject(new Error('deadline did not abort the screenshot')), 5_000);
+          const fail = (error: Error) => { clearTimeout(safety); reject(error); };
+          if (!signal) { fail(new Error('missing deadline signal')); return; }
+          if (signal.aborted) { fail(new Error('screenshot aborted')); return; }
+          signal.addEventListener('abort', () => fail(new Error('screenshot aborted')), { once: true });
+        });
+      }
+      return Buffer.from('png');
+    },
     locator() {
       return {
         async innerText() { return 'Hello'; },
         async evaluateAll() { return { links: [], linksOmitted: 0, overlongLinks: 0, textCapped: false }; },
-        async evaluate() { return { description: '', tables: [], jsonLd: [], textCapped: false }; },
+        async evaluate(fn: (root: unknown, bounds: { metaLimit: number }) => unknown, bounds: { metaLimit: number }) {
+          if (options.structureRoot) return fn(options.structureRoot, bounds);
+          return { description: '', tables: [], jsonLd: [], textCapped: false, jsonLdKept: 0, jsonLdOmitted: 0, rowsKept: 0, rowsOmitted: 0, cellsKept: 0, cellsOmitted: 0 };
+        },
       };
     },
     getByRole(role: string) {
@@ -561,7 +676,7 @@ function accessibilityTools(options: {
     validate: async raw => new URL(raw),
     resolve: async () => [{ address: '127.0.0.1', family: 4 as const }],
   });
-  return { tools };
+  return { tools, screenshots };
 }
 
 test('startup failure and stalled validation settle without leaking', async () => {
