@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { Browser } from 'playwright';
 import { ExtractionTimeout, createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
+import { HEADING_LIMIT, catalogDocument } from '../agent/lib/document-catalog.ts';
 
 const fixture = `<!doctype html><html><head><title>Safe fixture</title><meta name="description" content="Fixture description"></head><body>
 <h1>Fixture heading</h1>
@@ -18,6 +19,36 @@ const fixture = `<!doctype html><html><head><title>Safe fixture</title><meta nam
 <a href="/download" download>Download</a><iframe src="/frame"></iframe>
 <script src="/script"></script><script>fetch('/submit',{method:'POST'});document.title='Executed';</script>
 </body>`;
+
+const navDocument = `<!doctype html>
+<html><head><title>Outline</title></head><body>
+<nav>
+  <h3>Download</h3>
+  <h3>Docs by version</h3>
+</nav>
+<h1>Python 3.15.0 documentation</h1>
+<h2>Other resources</h2>
+<h3>Download</h3>
+<h2>Notes</h2>
+<h2>Notes</h2>
+<div class="sphinxsidebar" role="Navigation">
+  <h3>Download</h3>
+  <h3>Docs by version</h3>
+</div>
+<a href="/keep">Keep</a>
+</body></html>`;
+
+const outlineParts = Array.from({ length: HEADING_LIMIT }, (_, index) => `<h2>Part ${index}</h2>`).join('');
+const outlineDocument = `<!doctype html><html><head><title>Capped</title></head><body>
+<nav><h3>Download</h3><h3>Docs by version</h3></nav>
+<h1>Guide</h1>
+<h2>Notes</h2>
+<h2>Notes</h2>
+${outlineParts}
+<div role="navigation"><h3>Download</h3><h3>Docs by version</h3></div>
+<h2>Tail</h2>
+<a href="/keep">Keep</a>
+</body></html>`;
 
 test('real browser: startup, discovery, inspect protections, redirects, timeouts and cleanup', async t => {
   const requests: string[] = [];
@@ -35,8 +66,35 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
       response.end(`<html><head><title>Links</title></head><body><h1>Links</h1>${anchors}<a href="/${'z'.repeat(2100)}">Long</a></body></html>`);
       return;
     }
+    if (request.url === '/many') {
+      response.setHeader('content-type', 'text/html');
+      const buttons = Array.from({ length: 65 }, (_, index) => `<button>Action ${index}</button>`).join('');
+      response.end(`<body>${buttons}<button hidden>Hidden extra</button></body>`);
+      return;
+    }
+    if (request.url === '/sixty') {
+      response.setHeader('content-type', 'text/html');
+      const buttons = Array.from({ length: 60 }, (_, index) => `<button>Slot ${index}</button>`).join('');
+      response.end(`<body>${buttons}<button hidden>Secret</button><input hidden aria-label="Secret field"></body>`);
+      return;
+    }
+    if (request.url === '/essay') {
+      response.setHeader('content-type', 'text/html');
+      response.end(`<html><head><title>Essay</title></head><body><h1>Essay</h1><p>${'word '.repeat(4000)}</p><a href="/keep">Keep</a></body></html>`);
+      return;
+    }
+    if (request.url === '/nav') {
+      response.setHeader('content-type', 'text/html');
+      response.end(navDocument);
+      return;
+    }
+    if (request.url === '/outline') {
+      response.setHeader('content-type', 'text/html');
+      response.end(outlineDocument);
+      return;
+    }
     response.setHeader('content-type', 'text/html');
-    response.end(request.url === '/many' ? '<body>' + '<button>Action</button>'.repeat(65) + '</body>' : fixture);
+    response.end(fixture);
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -59,6 +117,12 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
       assert.ok(result.elements.some(e => e.accessibility.includes('Custom control')));
       assert.ok(result.elements.some(e => e.disabled && e.accessibility.includes('Unavailable')));
       assert.ok(!result.elements.some(e => e.accessibility.includes('Hidden control')));
+      const names = ['Next page', 'Download', 'Accessible action', 'Unavailable', 'Custom control', 'Submit GET', 'Choose File', 'Submit POST', 'Your name', 'Consent'];
+      assert.equal(result.elements.length, names.length);
+      names.forEach((name, index) => assert.ok(result.elements[index]?.accessibility.includes(name), name));
+      names.forEach((name, index) => assert.ok(result.elements[index]?.accessibility.includes(name), name));
+      assert.equal(result.truncated, false);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: names.length, omitted: 0, reasons: [] });
       assert.equal(browsers.at(-1)?.isConnected(), false);
     });
     await t.test('bounds the element inventory', async () => {
@@ -66,11 +130,28 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
       assert.equal(result.elements.length, 60);
       assert.equal(result.truncated, true);
       assert.equal('screenshotSha256' in result, false);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: false, kept: 60, omitted: 5, reasons: ['inventory-cap'] });
+      assert.equal(result.elements.every(element => element.role === 'button'), true);
+      assert.ok(result.elements[0]?.accessibility.includes('Action 0'));
+      assert.ok(result.elements[59]?.accessibility.includes('Action 59'));
+      assert.ok(!result.elements.some(element => element.accessibility.includes('Action 60') || element.accessibility.includes('Hidden extra')));
+    });
+    await t.test('an inventory of exactly 60 visible controls is complete', async () => {
+      const result = await tools.navigate(`${origin}/sixty`);
+      assert.equal(result.elements.length, 60);
+      assert.equal(result.truncated, false);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: 60, omitted: 0, reasons: [] });
+      assert.ok(result.elements[0]?.accessibility.includes('Slot 0'));
+      assert.ok(result.elements[59]?.accessibility.includes('Slot 59'));
+      assert.ok(!result.elements.some(element => element.accessibility.includes('Secret')));
+      assert.equal(browsers.at(-1)?.isConnected(), false);
     });
     await t.test('snapshot keeps the inventory and adds a PNG', async () => {
       const result = await tools.snapshotPage(origin);
       assert.equal(result.title, 'Safe fixture');
       assert.ok(result.elements.some(element => element.accessibility.includes('Accessible action')));
+      assert.equal(result.truncated, false);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: result.elements.length, omitted: 0, reasons: [] });
       assert.match(result.screenshotSha256, /^[a-f0-9]{64}$/);
       assert.equal(result.screenshotBytes, Buffer.from(result.screenshotBase64, 'base64').length);
       assert.ok(result.screenshotBytes > 100);
@@ -92,6 +173,7 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
       assert.equal(result.completeness.timedOut, false);
       assert.equal(result.completeness.timeoutStage, null);
       assert.equal(result.structured.completeness.complete, true);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: 10, omitted: 0, reasons: [] });
       assert.equal(result.links.length, result.structured.links.length);
       assert.deepEqual(result.structured.tables, [[['Column'], ['Cell']]]);
       assert.deepEqual(result.structured.jsonLd, [{ '@type': 'Thing', name: 'Fixture' }]);
@@ -112,6 +194,73 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
       assert.equal(result.completeness.reasons.includes('overlong-link'), true);
       assert.equal(result.structured.completeness.complete, false);
       assert.equal(result.links.some(link => link.url.length > 2048), false);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: false, kept: 60, omitted: 2, reasons: ['inventory-cap'] });
+      assert.deepEqual(result.completeness.reasons, ['overlong-link']);
+      assert.equal(browsers.at(-1)?.isConnected(), false);
+    });
+    await t.test('inspect de-duplicates nav headings and keeps repeated content headings', async () => {
+      const result = await tools.inspectPage(`${origin}/nav`);
+      const catalog = catalogDocument(navDocument, `${origin}/nav`);
+      assert.deepEqual(result.structured.headings, [
+        { level: 'h3', text: 'Download' },
+        { level: 'h3', text: 'Docs by version' },
+        { level: 'h1', text: 'Python 3.15.0 documentation' },
+        { level: 'h2', text: 'Other resources' },
+        { level: 'h3', text: 'Download' },
+        { level: 'h2', text: 'Notes' },
+        { level: 'h2', text: 'Notes' },
+      ]);
+      assert.deepEqual(result.structured.headings, catalog.headings);
+      assert.equal(result.completeness.headingsOmitted, 0);
+      assert.equal(result.completeness.complete, true);
+      assert.deepEqual(result.completeness.reasons, []);
+      assert.equal(result.structured.headings.filter(heading => heading.text === 'Notes').length, 2);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: 1, omitted: 0, reasons: [] });
+      assert.equal(browsers.at(-1)?.isConnected(), false);
+    });
+    await t.test('heading completeness uses the post-dedupe set and stays separate from the inventory', async () => {
+      const result = await tools.inspectPage(`${origin}/outline`);
+      const catalog = catalogDocument(outlineDocument, `${origin}/outline`);
+      assert.equal(catalog.completeness.headingsOmitted, 6);
+      assert.equal(catalog.headings.length, HEADING_LIMIT);
+      assert.deepEqual(result.structured.headings, catalog.headings);
+      assert.equal(result.structured.headings.filter(heading => heading.text === 'Notes').length, 2);
+      assert.equal(result.structured.headings.filter(heading => heading.text === 'Download').length, 1);
+      assert.deepEqual(result.structured.headings.slice(0, 5), [
+        { level: 'h3', text: 'Download' },
+        { level: 'h3', text: 'Docs by version' },
+        { level: 'h1', text: 'Guide' },
+        { level: 'h2', text: 'Notes' },
+        { level: 'h2', text: 'Notes' },
+      ]);
+      assert.equal(result.completeness.headingsKept, HEADING_LIMIT);
+      assert.equal(result.completeness.headingsOmitted, 6);
+      assert.equal(result.completeness.complete, false);
+      assert.deepEqual(result.completeness.reasons, ['heading-cap']);
+      assert.equal(result.truncated, false);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: 1, omitted: 0, reasons: [] });
+      assert.equal(browsers.at(-1)?.isConnected(), false);
+    });
+    await t.test('body text truncation is incomplete even when the inventory is complete', async () => {
+      const result = await tools.inspectPage(`${origin}/essay`);
+      assert.equal(result.truncated, true);
+      assert.equal(result.text.length, 18_000);
+      assert.equal(result.completeness.complete, false);
+      assert.deepEqual(result.completeness.reasons, ['text-cap']);
+      assert.equal(result.completeness.headingsOmitted, 0);
+      assert.equal(result.completeness.linksOmitted, 0);
+      assert.deepEqual(result.structured.headings, [{ level: 'h1', text: 'Essay' }]);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: 1, omitted: 0, reasons: [] });
+      assert.equal(browsers.at(-1)?.isConnected(), false);
+    });
+    await t.test('a capped inventory does not mark link and heading extraction incomplete', async () => {
+      const result = await tools.inspectPage(`${origin}/many`);
+      assert.equal(result.completeness.complete, true);
+      assert.deepEqual(result.completeness.reasons, []);
+      assert.equal(result.completeness.linksOmitted, 0);
+      assert.equal(result.completeness.headingsOmitted, 0);
+      assert.equal(result.truncated, false);
+      assert.deepEqual(result.accessibilityCompleteness, { complete: false, kept: 60, omitted: 5, reasons: ['inventory-cap'] });
       assert.equal(browsers.at(-1)?.isConnected(), false);
     });
     await t.test('validates redirects and bounds redirect loops', async () => {

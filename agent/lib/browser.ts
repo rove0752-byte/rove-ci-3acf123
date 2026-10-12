@@ -5,7 +5,7 @@ import { lookup } from 'node:dns/promises';
 import { existsSync } from 'node:fs';
 import { isIP } from 'node:net';
 import bundledChromium from '@sparticuz/chromium';
-import { buildCompleteness, extractionBounds, type TimeoutStage } from './document-catalog.ts';
+import { buildCompleteness, extractNavigationHeadings, extractionBounds, type TimeoutStage } from './document-catalog.ts';
 import { mandatoryChromiumArgs, startIsolatedNetwork, type IsolatedDocument, type IsolatedNetwork } from './egress-proxy.ts';
 import { publicAddress } from './public-address.ts';
 import { validateUrl } from './policy.ts';
@@ -254,16 +254,6 @@ export function createBrowserTools(dependencies: {
           return { text: text.slice(0, max), capped: text.length > max };
         };
         const description = clean(document.querySelector('meta[name="description" i]')?.getAttribute('content'), bounds.metaLimit);
-        const headings: { level: string; text: string }[] = [];
-        let headingsOmitted = 0;
-        let textCapped = description.capped;
-        for (const node of document.querySelectorAll('h1, h2, h3')) {
-          const cleaned = clean(node.textContent, bounds.textLimit);
-          if (!cleaned.text) continue;
-          if (cleaned.capped) textCapped = true;
-          if (headings.length >= bounds.headingLimit) { headingsOmitted += 1; continue; }
-          headings.push({ level: node.tagName.toLowerCase(), text: cleaned.text });
-        }
         const cell = (value: string | null | undefined) => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
         const tables = [...document.querySelectorAll('table')].slice(0, 5).map(table =>
           [...table.querySelectorAll('tr')].slice(0, 20).map(row =>
@@ -274,13 +264,15 @@ export function createBrowserTools(dependencies: {
           if (!raw || raw.length > 20_000) continue;
           try { jsonLd.push(JSON.parse(raw)); } catch { /* Invalid JSON-LD is data, not code, and is omitted. */ }
         }
-        return { description: description.text, headings, headingsOmitted, tables, jsonLd, textCapped };
+        return { description: description.text, tables, jsonLd, textCapped: description.capped };
       }, bounds);
       const links = extracted.links;
-      const textCapped = extracted.textCapped || catalog.textCapped || content.length > 18_000;
+      const headed = extractNavigationHeadings(await page.content());
+      const listed = await inventory(page, status);
+      const textCapped = extracted.textCapped || catalog.textCapped || headed.textCapped || content.length > 18_000;
       const completeness = buildCompleteness({
-        headingsKept: catalog.headings.length,
-        headingsOmitted: catalog.headingsOmitted,
+        headingsKept: headed.headings.length,
+        headingsOmitted: headed.headingsOmitted,
         linksKept: links.length,
         linksOmitted: extracted.linksOmitted,
         sectionsSkipped: 0,
@@ -292,32 +284,43 @@ export function createBrowserTools(dependencies: {
       const title = await page.title();
       return { evidenceId: randomUUID(), url: page.url(), title, httpStatus: status,
         capturedAt: new Date().toISOString(), text: content.slice(0, 18_000), truncated: content.length > 18_000,
-        links, completeness, structured: { title, description: catalog.description, headings: catalog.headings, links, tables: catalog.tables, jsonLd: catalog.jsonLd, completeness },
+        links, completeness, accessibilityCompleteness: listed.accessibilityCompleteness,
+        structured: { title, description: catalog.description, headings: headed.headings, links, tables: catalog.tables, jsonLd: catalog.jsonLd, completeness },
         screenshotBase64: screenshot.toString('base64'),
         screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), durationMs: Date.now() - started,
         mode: 'read_only_no_javascript' as const };
     });
   }
 
+  const inventoryLimit = 60;
+
+  function accessibilityCompleteness(kept: number, omitted: number) {
+    const reasons = omitted > 0 ? ['inventory-cap' as const] : [];
+    return { complete: reasons.length === 0, kept, omitted, reasons };
+  }
+
   async function inventory(page: Page, status: number) {
     const roles = ['link', 'button', 'textbox', 'checkbox', 'radio', 'combobox', 'listbox',
       'option', 'slider', 'spinbutton', 'switch', 'tab', 'menuitem', 'searchbox'] as const;
     const elements: { role: string; accessibility: string; disabled: boolean }[] = [];
-    let truncated = false;
+    let omitted = 0;
     for (const role of roles) {
       const matches = page.getByRole(role);
       const count = await matches.count();
       for (let index = 0; index < count; index++) {
-        // Accessibility inventory bound. Link extraction uses the shared LINK_LIMIT instead.
-        if (elements.length === 60) { truncated = true; break; }
         const element = matches.nth(index);
         if (!(await element.isVisible())) continue;
+        // The 60-element cap stays. Eligible controls after it are counted, not dropped silently.
+        if (elements.length >= inventoryLimit) { omitted += 1; continue; }
         elements.push({ role, accessibility: (await element.ariaSnapshot({ timeout: 1000 })).slice(0, 1000),
           disabled: await element.isDisabled() });
       }
     }
+    const truncated = omitted > 0;
     return { evidenceId: randomUUID(), url: page.url(), title: await page.title(), httpStatus: status,
-      capturedAt: new Date().toISOString(), elements, truncated, mode: 'read_only_no_javascript' as const };
+      capturedAt: new Date().toISOString(), elements, truncated,
+      accessibilityCompleteness: accessibilityCompleteness(elements.length, omitted),
+      mode: 'read_only_no_javascript' as const };
   }
 
   function navigate(raw: string) {

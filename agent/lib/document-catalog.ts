@@ -389,23 +389,36 @@ function metadataFrom(regionsFound: Region[], html: string, truncation?: Truncat
   return metadata;
 }
 
-function catalogFrom(html: string, pageUrl: string, source: Region[], options?: CatalogOptions): DocumentCatalog {
-  const base = pageBase(pageUrl, html);
+function collectHeadings(html: string, source: Region[], truncation: Truncation): { headings: Heading[]; headingsOmitted: number } {
   const ranges = navigationRanges(html);
-  const truncation: Truncation = { text: false };
   const headings: Heading[] = [];
-  const links: DocumentLink[] = [];
   const seenNav = new Set<string>();
   let headingsOmitted = 0;
+  for (const region of source) {
+    if (region.kind !== 'h1' && region.kind !== 'h2' && region.kind !== 'h3') continue;
+    const text = clean(region.body, TEXT_LIMIT, truncation);
+    headingsOmitted += considerHeading(headings, seenNav, region.kind, text, insideNavigation(ranges, region.at));
+  }
+  return { headings, headingsOmitted };
+}
+
+// Same nav-heading walk the catalog stores. Repeated nav headings are not cap omissions.
+export function extractNavigationHeadings(html: string): { headings: Heading[]; headingsOmitted: number; textCapped: boolean } {
+  const truncation: Truncation = { text: false };
+  const collected = collectHeadings(html, regions(html), truncation);
+  return { ...collected, textCapped: truncation.text };
+}
+
+function catalogFrom(html: string, pageUrl: string, source: Region[], options?: CatalogOptions): DocumentCatalog {
+  const base = pageBase(pageUrl, html);
+  const truncation: Truncation = { text: false };
+  const { headings, headingsOmitted } = collectHeadings(html, source, truncation);
+  const links: DocumentLink[] = [];
   let linksOmitted = 0;
   let overlongLinks = 0;
   let title = '';
   for (const region of source) {
     if (region.kind === 'title' && !title) title = clean(region.body, TEXT_LIMIT, truncation);
-    if (region.kind === 'h1' || region.kind === 'h2' || region.kind === 'h3') {
-      const text = clean(region.body, TEXT_LIMIT, truncation);
-      headingsOmitted += considerHeading(headings, seenNav, region.kind, text, insideNavigation(ranges, region.at));
-    }
     if (region.kind === 'a') {
       const decision = acceptedLink(region.attrs.get('href') ?? '', base);
       if (!decision) continue;

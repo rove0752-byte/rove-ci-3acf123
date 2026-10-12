@@ -8,6 +8,7 @@ import {
   auditCatalog,
   buildCompleteness,
   catalogDocument,
+  extractNavigationHeadings,
   extractionBounds,
   timeoutFailure,
   verifyExtraction,
@@ -251,9 +252,35 @@ test('repeated nav headings collapse and real headings stay', () => {
   assert.deepEqual(catalog.links, [{ text: 'Keep', url: 'https://docs.example/keep' }]);
   assert.equal(catalog.completeness.complete, true);
   assert.equal(catalog.completeness.headingsOmitted, 0);
+  const extracted = extractNavigationHeadings(html);
+  assert.deepEqual(extracted.headings, catalog.headings);
+  assert.equal(extracted.headingsOmitted, 0);
+  assert.equal(extracted.textCapped, false);
   const check = verifyExtraction(html, 'https://docs.example/', catalog);
   assert.equal(check.pass, true);
   assert.equal(check.complete, true);
+});
+
+test('heading cap counts only headings that remain after nav de-duplication', () => {
+  const parts = Array.from({ length: HEADING_LIMIT }, (_, index) => `<h2>Part ${index}</h2>`).join('');
+  const html = `<title>Outline</title><nav><h3>Download</h3></nav>${parts}<nav><h3>Download</h3></nav><h2>Tail</h2>`;
+  const catalog = catalogDocument(html, 'https://docs.example/');
+  const extracted = extractNavigationHeadings(html);
+  assert.equal(catalog.headings.length, HEADING_LIMIT);
+  assert.equal(catalog.completeness.headingsKept, HEADING_LIMIT);
+  assert.equal(catalog.completeness.headingsOmitted, 2);
+  assert.equal(catalog.completeness.complete, false);
+  assert.deepEqual(catalog.completeness.reasons, ['heading-cap']);
+  assert.deepEqual(catalog.headings[0], { level: 'h3', text: 'Download' });
+  assert.equal(catalog.headings.filter(heading => heading.text === 'Download').length, 1);
+  assert.equal(catalog.headings.at(-1)?.text, `Part ${HEADING_LIMIT - 2}`);
+  assert.equal(catalog.headings.some(heading => heading.text === 'Tail'), false);
+  assert.deepEqual(extracted.headings, catalog.headings);
+  assert.equal(extracted.headingsOmitted, catalog.completeness.headingsOmitted);
+  assert.equal(extracted.textCapped, false);
+  const check = verifyExtraction(html, 'https://docs.example/', catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, false);
 });
 
 test('an unclosed section is incomplete', () => {
@@ -316,6 +343,9 @@ test('the saved Python docs page keeps footer links and one copy of each nav hea
   ]);
   assert.equal(catalog.headings.filter(heading => heading.text === 'Download').length, 1);
   assert.equal(saved.headings.filter(heading => heading.text === 'Download').length, 2);
+  const extracted = extractNavigationHeadings(html);
+  assert.deepEqual(extracted.headings, catalog.headings);
+  assert.equal(extracted.headingsOmitted, catalog.completeness.headingsOmitted);
   const check = verifyExtraction(html, pageUrl, catalog);
   assert.equal(check.pass, true);
   assert.equal(check.complete, true);
