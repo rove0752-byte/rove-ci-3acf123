@@ -4,8 +4,12 @@ import test from 'node:test';
 import {
   HEADING_LIMIT,
   LINK_LIMIT,
+  LINK_URL_LIMIT,
   auditCatalog,
+  buildCompleteness,
   catalogDocument,
+  extractionBounds,
+  timeoutFailure,
   verifyExtraction,
   type DocumentCatalog,
 } from '../agent/lib/document-catalog.ts';
@@ -60,7 +64,9 @@ const expected: DocumentCatalog = {
     linksKept: 3,
     linksOmitted: 0,
     sectionsSkipped: 0,
+    overlongLinks: 0,
     timedOut: false,
+    timeoutStage: null,
   },
 };
 
@@ -266,8 +272,13 @@ test('an unclosed section is incomplete', () => {
 test('a timeout is recorded on the catalog', () => {
   const catalog = catalogDocument(page, 'https://docs.example/start', { timedOut: true });
   assert.equal(catalog.completeness.timedOut, true);
+  assert.equal(catalog.completeness.timeoutStage, 'catalog');
   assert.equal(catalog.completeness.complete, false);
   assert.deepEqual(catalog.completeness.reasons, ['timeout']);
+  const staged = catalogDocument(page, 'https://docs.example/start', { timedOut: true, timeoutStage: 'navigation' });
+  assert.equal(staged.completeness.timeoutStage, 'navigation');
+  assert.equal(staged.completeness.complete, false);
+  assert.equal(verifyExtraction(page, 'https://docs.example/start', staged, { timedOut: true, timeoutStage: 'navigation' }).pass, true);
   const check = verifyExtraction(page, 'https://docs.example/start', catalog, { timedOut: true });
   assert.equal(check.pass, true);
   assert.equal(check.complete, false);
@@ -311,6 +322,63 @@ test('the saved Python docs page keeps footer links and one copy of each nav hea
   assert.equal(check.countsMatch, true);
   assert.equal(check.linkIntegrity, true);
   assert.equal(auditCatalog(html, pageUrl, catalog).pass, true);
+});
+
+test('links longer than 2048 characters are omitted', () => {
+  const href = `https://docs.example/${'a'.repeat(2100)}`;
+  const html = `<title>Long</title><a href="${href}">Big</a><a href="https://docs.example/ok">Ok</a>`;
+  const catalog = catalogDocument(html, 'https://docs.example/');
+  assert.deepEqual(catalog.links, [{ text: 'Ok', url: 'https://docs.example/ok' }]);
+  assert.equal(catalog.completeness.overlongLinks, 1);
+  assert.equal(catalog.completeness.linksOmitted, 0);
+  assert.equal(catalog.completeness.complete, false);
+  assert.deepEqual(catalog.completeness.reasons, ['overlong-link']);
+  const check = verifyExtraction(html, 'https://docs.example/', catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, false);
+  const resolved = `<title>R</title><a href="/${'b'.repeat(2040)}">P</a>`;
+  const expanded = catalogDocument(resolved, 'https://docs.example/base/');
+  assert.equal(expanded.links.length, 0);
+  assert.equal(expanded.completeness.overlongLinks, 1);
+  assert.equal(expanded.completeness.complete, false);
+  assert.equal(verifyExtraction(resolved, 'https://docs.example/base/', expanded).pass, true);
+  const script = `<title>J</title><a href="javascript:${'a'.repeat(2100)}">X</a><a href="https://docs.example/ok">Ok</a>`;
+  const ignored = catalogDocument(script, 'https://docs.example/');
+  assert.equal(ignored.completeness.overlongLinks, 0);
+  assert.equal(ignored.completeness.complete, true);
+  assert.deepEqual(ignored.links, [{ text: 'Ok', url: 'https://docs.example/ok' }]);
+});
+
+test('browser inspect and the document catalog share extraction bounds', () => {
+  const bounds = extractionBounds();
+  assert.equal(bounds.linkLimit, LINK_LIMIT);
+  assert.equal(bounds.headingLimit, HEADING_LIMIT);
+  assert.equal(bounds.linkUrlLimit, LINK_URL_LIMIT);
+  assert.equal(LINK_LIMIT, 500);
+  assert.equal(LINK_URL_LIMIT, 2048);
+  const browserSource = readFileSync(new URL('../agent/lib/browser.ts', import.meta.url), 'utf8');
+  assert.equal(browserSource.includes('extractionBounds('), true);
+  assert.equal(browserSource.includes('slice(0, 60)'), false);
+  assert.equal(browserSource.includes('overlongLinks'), true);
+  assert.equal(browserSource.includes('new ExtractionTimeout('), true);
+  const html = `<title>Same</title><h1>One</h1><a href="https://docs.example/a">A</a><a href="https://docs.example/${'c'.repeat(2100)}">C</a>`;
+  const catalog = catalogDocument(html, 'https://docs.example/');
+  assert.deepEqual(catalog.completeness, buildCompleteness({
+    headingsKept: catalog.headings.length,
+    headingsOmitted: catalog.completeness.headingsOmitted,
+    linksKept: catalog.links.length,
+    linksOmitted: catalog.completeness.linksOmitted,
+    sectionsSkipped: catalog.completeness.sectionsSkipped,
+    textCapped: false,
+    overlongLinks: catalog.completeness.overlongLinks,
+  }));
+  assert.equal(catalog.links.length, 1);
+  assert.equal(catalog.completeness.complete, false);
+  const failure = timeoutFailure('fetch');
+  assert.deepEqual(failure, { complete: false, failed: true, reason: 'timeout', stage: 'fetch', timedOut: true });
+  const fetchSource = readFileSync(new URL('../scripts/fetch-structured-page.ts', import.meta.url), 'utf8');
+  assert.equal(fetchSource.includes('timeoutFailure('), true);
+  assert.equal(fetchSource.includes('timeout stage='), true);
 });
 
 test('document fetch records extraction verification', () => {

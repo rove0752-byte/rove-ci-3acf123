@@ -5,9 +5,23 @@ import { lookup } from 'node:dns/promises';
 import { existsSync } from 'node:fs';
 import { isIP } from 'node:net';
 import bundledChromium from '@sparticuz/chromium';
+import { buildCompleteness, extractionBounds, type TimeoutStage } from './document-catalog.ts';
 import { mandatoryChromiumArgs, startIsolatedNetwork, type IsolatedDocument, type IsolatedNetwork } from './egress-proxy.ts';
 import { publicAddress } from './public-address.ts';
 import { validateUrl } from './policy.ts';
+
+export class ExtractionTimeout extends Error {
+  readonly complete = false;
+  readonly failed = true;
+  readonly reason = 'timeout';
+  readonly timedOut = true;
+  readonly stage: TimeoutStage;
+  constructor(stage: TimeoutStage) {
+    super(`Browser operation timed out during ${stage}.`);
+    this.name = 'ExtractionTimeout';
+    this.stage = stage;
+  }
+}
 
 export type PinnedAddress = { address: string; family: 4 | 6 };
 
@@ -50,7 +64,7 @@ function knownFetchError(error: unknown): Error {
 async function fetchDocument(browser: Browser, url: URL, addresses: readonly PinnedAddress[], timeoutMs: number, signal: AbortSignal): Promise<IsolatedDocument> {
   const pinned = addresses[0];
   if (!pinned || isIP(pinned.address) !== pinned.family) throw new Error('Private and reserved network targets are blocked.');
-  if (signal.aborted) throw new Error('Browser operation timed out.');
+  if (signal.aborted) throw new ExtractionTimeout('deadline');
   const secure = url.protocol === 'https:';
   const port = Number(url.port || (secure ? 443 : 80));
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Navigation failed.');
@@ -61,7 +75,10 @@ async function fetchDocument(browser: Browser, url: URL, addresses: readonly Pin
       servername: hostname, hostHeader: url.host, path: `${url.pathname}${url.search}`, timeoutMs,
     }, signal);
   } catch (error) {
-    throw knownFetchError(error);
+    if (signal.aborted) throw new ExtractionTimeout('deadline');
+    const known = knownFetchError(error);
+    if (known.message === 'Browser operation timed out.') throw new ExtractionTimeout('fetch');
+    throw known;
   }
 }
 
@@ -120,18 +137,18 @@ export function createBrowserTools(dependencies: {
       timer = setTimeout(() => {
         expired = true;
         controller.abort();
-        reject(new Error('Browser operation timed out.'));
+        reject(new ExtractionTimeout('deadline'));
         void close().catch(() => {});
       }, timeoutMs);
     });
     const work = async () => {
       if (raw.length > 2048) throw new Error('URL exceeds 2048 characters.');
       await validate(raw);
-      if (expired) throw new Error('Browser operation timed out.');
+      if (expired) throw new ExtractionTimeout('deadline');
       browser = await launch();
       const session = browser;
       // A startup that finishes after the deadline must not leak a process.
-      if (expired) { await close(); throw new Error('Browser operation timed out.'); }
+      if (expired) { await close(); throw new ExtractionTimeout('deadline'); }
       const context = await browser.newContext({ javaScriptEnabled: false, serviceWorkers: 'block',
         acceptDownloads: false, viewport: { width: 1280, height: 900 } });
       context.setDefaultTimeout(5000);
@@ -184,6 +201,7 @@ export function createBrowserTools(dependencies: {
           response = await page.goto(target, { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
         } catch (error) {
           if (hop.failure) throw hop.failure;
+          if (error instanceof Error && /timeout|timed out/i.test(error.message)) throw new ExtractionTimeout('navigation');
           throw error;
         }
         if (hop.failure) throw hop.failure;
@@ -211,36 +229,73 @@ export function createBrowserTools(dependencies: {
     const started = Date.now();
     return visit(raw, async (page, status) => {
       const content = await page.locator('body').innerText();
+      const bounds = extractionBounds();
       // Fixed catalog only. The page supplies data; caller selectors and scripts are not accepted.
-      const links = await page.locator('a[href]').evaluateAll(nodes => nodes.slice(0, 60).map(node => ({
-        text: (node.textContent ?? '').trim().slice(0, 150), url: (node as HTMLAnchorElement).href,
-      })).filter(link => /^https?:/.test(link.url)));
-      const catalog = await page.locator('html').evaluate(() => {
-        const clean = (value: string | null | undefined, max: number) => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
-        const description = clean(document.querySelector('meta[name="description" i]')?.getAttribute('content'), 1000);
-        const headings = [...document.querySelectorAll('h1, h2, h3')].slice(0, 20).flatMap(node => {
-          const text = clean(node.textContent, 300);
-          return text ? [{ level: node.tagName.toLowerCase(), text }] : [];
-        });
+      // The old inspect path kept only the first 60 anchors and dropped the rest with no omission count.
+      const extracted = await page.locator('a[href]').evaluateAll((nodes, bounds) => {
+        const links: { text: string; url: string }[] = [];
+        let linksOmitted = 0;
+        let overlongLinks = 0;
+        let textCapped = false;
+        for (const node of nodes) {
+          const href = (node as HTMLAnchorElement).href || '';
+          if (!/^https?:/i.test(href)) continue;
+          if (href.length > bounds.linkUrlLimit) { overlongLinks += 1; continue; }
+          const raw = (node.textContent ?? '').replace(/\s+/g, ' ').trim();
+          if (raw.length > bounds.linkTextLimit) textCapped = true;
+          if (links.length >= bounds.linkLimit) { linksOmitted += 1; continue; }
+          links.push({ text: raw.slice(0, bounds.linkTextLimit), url: href });
+        }
+        return { links, linksOmitted, overlongLinks, textCapped };
+      }, bounds);
+      const catalog = await page.locator('html').evaluate((_root, bounds) => {
+        const clean = (value: string | null | undefined, max: number) => {
+          const text = (value ?? '').replace(/\s+/g, ' ').trim();
+          return { text: text.slice(0, max), capped: text.length > max };
+        };
+        const description = clean(document.querySelector('meta[name="description" i]')?.getAttribute('content'), bounds.metaLimit);
+        const headings: { level: string; text: string }[] = [];
+        let headingsOmitted = 0;
+        let textCapped = description.capped;
+        for (const node of document.querySelectorAll('h1, h2, h3')) {
+          const cleaned = clean(node.textContent, bounds.textLimit);
+          if (!cleaned.text) continue;
+          if (cleaned.capped) textCapped = true;
+          if (headings.length >= bounds.headingLimit) { headingsOmitted += 1; continue; }
+          headings.push({ level: node.tagName.toLowerCase(), text: cleaned.text });
+        }
+        const cell = (value: string | null | undefined) => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
         const tables = [...document.querySelectorAll('table')].slice(0, 5).map(table =>
           [...table.querySelectorAll('tr')].slice(0, 20).map(row =>
-            [...row.querySelectorAll('th, td')].slice(0, 10).map(cell => clean(cell.textContent, 200))));
+            [...row.querySelectorAll('th, td')].slice(0, 10).map(item => cell(item.textContent))));
         const jsonLd: unknown[] = [];
         for (const node of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0, 5)) {
           const raw = (node.textContent ?? '').trim();
           if (!raw || raw.length > 20_000) continue;
           try { jsonLd.push(JSON.parse(raw)); } catch { /* Invalid JSON-LD is data, not code, and is omitted. */ }
         }
-        return { description, headings, tables, jsonLd };
+        return { description: description.text, headings, headingsOmitted, tables, jsonLd, textCapped };
+      }, bounds);
+      const links = extracted.links;
+      const textCapped = extracted.textCapped || catalog.textCapped || content.length > 18_000;
+      const completeness = buildCompleteness({
+        headingsKept: catalog.headings.length,
+        headingsOmitted: catalog.headingsOmitted,
+        linksKept: links.length,
+        linksOmitted: extracted.linksOmitted,
+        sectionsSkipped: 0,
+        textCapped,
+        overlongLinks: extracted.overlongLinks,
+        timedOut: false,
       });
       const screenshot = await page.screenshot({ type: 'png', timeout: 5000 });
       const title = await page.title();
       return { evidenceId: randomUUID(), url: page.url(), title, httpStatus: status,
         capturedAt: new Date().toISOString(), text: content.slice(0, 18_000), truncated: content.length > 18_000,
-        links, structured: { title, description: catalog.description, headings: catalog.headings, links, tables: catalog.tables, jsonLd: catalog.jsonLd },
+        links, completeness, structured: { title, description: catalog.description, headings: catalog.headings, links, tables: catalog.tables, jsonLd: catalog.jsonLd, completeness },
         screenshotBase64: screenshot.toString('base64'),
         screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), durationMs: Date.now() - started,
-        mode: 'read_only_no_javascript' };
+        mode: 'read_only_no_javascript' as const };
     });
   }
 
@@ -253,6 +308,7 @@ export function createBrowserTools(dependencies: {
       const matches = page.getByRole(role);
       const count = await matches.count();
       for (let index = 0; index < count; index++) {
+        // Accessibility inventory bound. Link extraction uses the shared LINK_LIMIT instead.
         if (elements.length === 60) { truncated = true; break; }
         const element = matches.nth(index);
         if (!(await element.isVisible())) continue;

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { Browser } from 'playwright';
-import { createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
+import { ExtractionTimeout, createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
 
 const fixture = `<!doctype html><html><head><title>Safe fixture</title><meta name="description" content="Fixture description"></head><body>
 <h1>Fixture heading</h1>
@@ -29,6 +29,12 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
     if (request.url === '/loop') { response.writeHead(302, { location: '/loop' }); response.end(); return; }
     if (request.url === '/download') { response.writeHead(200, { 'content-disposition': 'attachment; filename=test.txt' }); response.end('blocked'); return; }
     if (request.url === '/error') { response.writeHead(500); response.end(); return; }
+    if (request.url === '/links') {
+      response.setHeader('content-type', 'text/html');
+      const anchors = Array.from({ length: 61 }, (_, index) => `<a href="/p/${index}">P${index}</a>`).join('');
+      response.end(`<html><head><title>Links</title></head><body><h1>Links</h1>${anchors}<a href="/${'z'.repeat(2100)}">Long</a></body></html>`);
+      return;
+    }
     response.setHeader('content-type', 'text/html');
     response.end(request.url === '/many' ? '<body>' + '<button>Action</button>'.repeat(65) + '</body>' : fixture);
   });
@@ -80,11 +86,32 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
       assert.equal(result.structured.description, 'Fixture description');
       assert.deepEqual(result.structured.headings, [{ level: 'h1', text: 'Fixture heading' }]);
       assert.ok(result.structured.links.some(link => link.url === `${origin}/next`));
+      assert.equal(result.completeness.complete, true);
+      assert.equal(result.completeness.linksOmitted, 0);
+      assert.equal(result.completeness.overlongLinks, 0);
+      assert.equal(result.completeness.timedOut, false);
+      assert.equal(result.completeness.timeoutStage, null);
+      assert.equal(result.structured.completeness.complete, true);
+      assert.equal(result.links.length, result.structured.links.length);
       assert.deepEqual(result.structured.tables, [[['Column'], ['Cell']]]);
       assert.deepEqual(result.structured.jsonLd, [{ '@type': 'Thing', name: 'Fixture' }]);
       assert.match(result.screenshotSha256, /^[a-f0-9]{64}$/);
       assert.ok(Buffer.from(result.screenshotBase64, 'base64').length > 100);
       assert.ok(!requests.some(request => /submit|script|frame|download/.test(request)));
+      assert.equal(browsers.at(-1)?.isConnected(), false);
+    });
+    await t.test('inspect keeps links past the old cap and reports an overlong url', async () => {
+      const result = await tools.inspectPage(`${origin}/links`);
+      assert.equal(result.title, 'Links');
+      assert.equal(result.links.length, 61);
+      assert.equal(result.links.some(link => link.url === `${origin}/p/60`), true);
+      assert.equal(result.completeness.linksKept, 61);
+      assert.equal(result.completeness.linksOmitted, 0);
+      assert.equal(result.completeness.overlongLinks, 1);
+      assert.equal(result.completeness.complete, false);
+      assert.equal(result.completeness.reasons.includes('overlong-link'), true);
+      assert.equal(result.structured.completeness.complete, false);
+      assert.equal(result.links.some(link => link.url.length > 2048), false);
       assert.equal(browsers.at(-1)?.isConnected(), false);
     });
     await t.test('validates redirects and bounds redirect loops', async () => {
@@ -99,8 +126,23 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
       assert.ok(browsers.every(browser => !browser.isConnected()));
     });
     await t.test('navigation timeout and total deadline close the browser', async () => {
-      await assert.rejects(createBrowserTools({ launch, validate, navigationTimeoutMs: 100 }).navigate(`${origin}/slow`));
-      await assert.rejects(createBrowserTools({ launch, validate, timeoutMs: 1500 }).navigate(`${origin}/slow`), /timed out/);
+      await assert.rejects(createBrowserTools({ launch, validate, navigationTimeoutMs: 100 }).navigate(`${origin}/slow`), (error: unknown) => {
+        assert.ok(error instanceof ExtractionTimeout);
+        assert.equal(error.complete, false);
+        assert.equal(error.failed, true);
+        assert.equal(error.reason, 'timeout');
+        assert.equal(error.timedOut, true);
+        assert.equal(error.stage === 'fetch' || error.stage === 'navigation', true);
+        assert.match(error.message, /timed out/);
+        return true;
+      });
+      await assert.rejects(createBrowserTools({ launch, validate, timeoutMs: 1500 }).navigate(`${origin}/slow`), (error: unknown) => {
+        assert.ok(error instanceof ExtractionTimeout);
+        assert.equal(error.stage, 'deadline');
+        assert.equal(error.complete, false);
+        assert.match(error.message, /timed out/);
+        return true;
+      });
       assert.ok(browsers.every(browser => !browser.isConnected()));
     });
   } finally {

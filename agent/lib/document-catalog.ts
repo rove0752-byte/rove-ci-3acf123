@@ -7,7 +7,8 @@ export type DocumentMetadata = {
   robots: string;
   ogTitle: string;
 };
-export type CompletenessReason = 'link-cap' | 'heading-cap' | 'section-skipped' | 'text-cap' | 'timeout';
+export type CompletenessReason = 'link-cap' | 'heading-cap' | 'section-skipped' | 'text-cap' | 'overlong-link' | 'timeout';
+export type TimeoutStage = 'deadline' | 'navigation' | 'fetch' | 'catalog';
 export type ExtractionCompleteness = {
   complete: boolean;
   reasons: CompletenessReason[];
@@ -16,7 +17,9 @@ export type ExtractionCompleteness = {
   linksKept: number;
   linksOmitted: number;
   sectionsSkipped: number;
+  overlongLinks: number;
   timedOut: boolean;
+  timeoutStage: TimeoutStage | null;
 };
 export type DocumentCatalog = {
   title: string;
@@ -26,7 +29,7 @@ export type DocumentCatalog = {
   completeness: ExtractionCompleteness;
 };
 export type CatalogMismatch = { field: string; detail: string };
-export type CatalogOptions = { timedOut?: boolean };
+export type CatalogOptions = { timedOut?: boolean; timeoutStage?: TimeoutStage };
 export type ExtractionVerification = {
   pass: boolean;
   complete: boolean;
@@ -39,9 +42,58 @@ export type ExtractionVerification = {
 export const HEADING_LIMIT = 20;
 // The reviewed docs.python.org/3/ page has more than 60 eligible links. Stopping there dropped the footer.
 export const LINK_LIMIT = 500;
+export const LINK_URL_LIMIT = 2048;
 const TEXT_LIMIT = 300;
 const LINK_TEXT_LIMIT = 150;
 const META_LIMIT = 1000;
+
+export function extractionBounds() {
+  return {
+    linkLimit: LINK_LIMIT,
+    headingLimit: HEADING_LIMIT,
+    linkUrlLimit: LINK_URL_LIMIT,
+    linkTextLimit: LINK_TEXT_LIMIT,
+    textLimit: TEXT_LIMIT,
+    metaLimit: META_LIMIT,
+  };
+}
+
+export function timeoutFailure(stage: TimeoutStage) {
+  return { complete: false as const, failed: true as const, reason: 'timeout' as const, stage, timedOut: true as const };
+}
+
+export function buildCompleteness(counts: {
+  headingsKept: number;
+  headingsOmitted: number;
+  linksKept: number;
+  linksOmitted: number;
+  sectionsSkipped: number;
+  textCapped: boolean;
+  overlongLinks: number;
+  timedOut?: boolean;
+  timeoutStage?: TimeoutStage | null;
+}): ExtractionCompleteness {
+  const reasons: CompletenessReason[] = [];
+  if (counts.linksOmitted > 0) reasons.push('link-cap');
+  if (counts.headingsOmitted > 0) reasons.push('heading-cap');
+  if (counts.sectionsSkipped > 0) reasons.push('section-skipped');
+  if (counts.textCapped) reasons.push('text-cap');
+  if (counts.overlongLinks > 0) reasons.push('overlong-link');
+  const timedOut = counts.timedOut === true;
+  if (timedOut) reasons.push('timeout');
+  return {
+    complete: reasons.length === 0,
+    reasons,
+    headingsKept: counts.headingsKept,
+    headingsOmitted: counts.headingsOmitted,
+    linksKept: counts.linksKept,
+    linksOmitted: counts.linksOmitted,
+    sectionsSkipped: counts.sectionsSkipped,
+    overlongLinks: counts.overlongLinks,
+    timedOut,
+    timeoutStage: timedOut ? (counts.timeoutStage ?? 'catalog') : null,
+  };
+}
 
 const NAMED_ENTITIES: Record<string, string> = {
   amp: '&',
@@ -100,13 +152,16 @@ function pageBase(pageUrl: string, html: string): URL {
   return page;
 }
 
-function absoluteHttp(href: string, base: URL): string | null {
-  if (!href || href.length > 2048 || /[\r\n\0]/.test(href) || href.startsWith('#')) return null;
+function acceptedLink(href: string, base: URL): { url: string } | { overlong: true } | null {
+  if (!href || href.startsWith('#') || /[\r\n\0]/.test(href)) return null;
+  if (/^[a-zA-Z][a-zA-Z+.-]*:/.test(href) && !/^https?:/i.test(href)) return null;
+  if (href.length > LINK_URL_LIMIT) return { overlong: true };
   try {
     const url = new URL(href, base);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
     url.hash = '';
-    return url.href;
+    if (url.href.length > LINK_URL_LIMIT) return { overlong: true };
+    return { url: url.href };
   } catch {
     return null;
   }
@@ -256,30 +311,25 @@ function finishCatalog(
   headings: Heading[],
   links: DocumentLink[],
   metadata: DocumentMetadata,
-  counts: { headingsOmitted: number; linksOmitted: number; sectionsSkipped: number; text: boolean },
+  counts: { headingsOmitted: number; linksOmitted: number; sectionsSkipped: number; text: boolean; overlongLinks: number },
   options?: CatalogOptions,
 ): DocumentCatalog {
-  const reasons: CompletenessReason[] = [];
-  if (counts.linksOmitted > 0) reasons.push('link-cap');
-  if (counts.headingsOmitted > 0) reasons.push('heading-cap');
-  if (counts.sectionsSkipped > 0) reasons.push('section-skipped');
-  if (counts.text) reasons.push('text-cap');
-  if (options?.timedOut) reasons.push('timeout');
   return {
     title,
     headings,
     links,
     metadata,
-    completeness: {
-      complete: reasons.length === 0,
-      reasons,
+    completeness: buildCompleteness({
       headingsKept: headings.length,
       headingsOmitted: counts.headingsOmitted,
       linksKept: links.length,
       linksOmitted: counts.linksOmitted,
       sectionsSkipped: counts.sectionsSkipped,
+      textCapped: counts.text,
+      overlongLinks: counts.overlongLinks,
       timedOut: options?.timedOut === true,
-    },
+      timeoutStage: options?.timeoutStage,
+    }),
   };
 }
 
@@ -299,10 +349,12 @@ function scanDocument(html: string, pageUrl: string, options?: CatalogOptions): 
   }
   const links: DocumentLink[] = [];
   let linksOmitted = 0;
+  let overlongLinks = 0;
   for (const match of visible.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)) {
-    const url = absoluteHttp(attributes(`<a${match[1] ?? ''}>`).get('href') ?? '', base);
-    if (!url) continue;
-    linksOmitted += considerLink(links, clean(match[2] ?? '', LINK_TEXT_LIMIT, truncation), url);
+    const decision = acceptedLink(attributes(`<a${match[1] ?? ''}>`).get('href') ?? '', base);
+    if (!decision) continue;
+    if ('overlong' in decision) { overlongLinks += 1; continue; }
+    linksOmitted += considerLink(links, clean(match[2] ?? '', LINK_TEXT_LIMIT, truncation), decision.url);
   }
   const tags: Region[] = [];
   for (const match of visible.matchAll(/<(meta|link)\b[^>]*>/gi)) {
@@ -313,6 +365,7 @@ function scanDocument(html: string, pageUrl: string, options?: CatalogOptions): 
     linksOmitted,
     sectionsSkipped: skippedRegionCount(html),
     text: truncation.text,
+    overlongLinks,
   }, options);
 }
 
@@ -345,6 +398,7 @@ function catalogFrom(html: string, pageUrl: string, source: Region[], options?: 
   const seenNav = new Set<string>();
   let headingsOmitted = 0;
   let linksOmitted = 0;
+  let overlongLinks = 0;
   let title = '';
   for (const region of source) {
     if (region.kind === 'title' && !title) title = clean(region.body, TEXT_LIMIT, truncation);
@@ -353,9 +407,10 @@ function catalogFrom(html: string, pageUrl: string, source: Region[], options?: 
       headingsOmitted += considerHeading(headings, seenNav, region.kind, text, insideNavigation(ranges, region.at));
     }
     if (region.kind === 'a') {
-      const url = absoluteHttp(region.attrs.get('href') ?? '', base);
-      if (!url) continue;
-      linksOmitted += considerLink(links, clean(region.body, LINK_TEXT_LIMIT, truncation), url);
+      const decision = acceptedLink(region.attrs.get('href') ?? '', base);
+      if (!decision) continue;
+      if ('overlong' in decision) { overlongLinks += 1; continue; }
+      linksOmitted += considerLink(links, clean(region.body, LINK_TEXT_LIMIT, truncation), decision.url);
     }
   }
   return finishCatalog(title, headings, links, metadataFrom(source, html, truncation), {
@@ -363,6 +418,7 @@ function catalogFrom(html: string, pageUrl: string, source: Region[], options?: 
     linksOmitted,
     sectionsSkipped: skippedRegionCount(html),
     text: truncation.text,
+    overlongLinks,
   }, options);
 }
 
@@ -394,23 +450,29 @@ function countsMatch(catalog: DocumentCatalog): boolean {
   if (completeness.headingsOmitted > 0) expected.push('heading-cap');
   if (completeness.sectionsSkipped > 0) expected.push('section-skipped');
   if (completeness.reasons.includes('text-cap')) expected.push('text-cap');
+  if (completeness.overlongLinks > 0) expected.push('overlong-link');
   if (completeness.timedOut) expected.push('timeout');
   const sameReasons = completeness.reasons.length === expected.length
     && completeness.reasons.every((reason, index) => reason === expected[index]);
+  const stageOk = completeness.timedOut
+    ? typeof completeness.timeoutStage === 'string' && completeness.timeoutStage.length > 0
+    : completeness.timeoutStage === null;
   return completeness.headingsKept === catalog.headings.length
     && completeness.linksKept === catalog.links.length
     && Number.isInteger(completeness.headingsOmitted) && completeness.headingsOmitted >= 0
     && Number.isInteger(completeness.linksOmitted) && completeness.linksOmitted >= 0
     && Number.isInteger(completeness.sectionsSkipped) && completeness.sectionsSkipped >= 0
+    && Number.isInteger(completeness.overlongLinks) && completeness.overlongLinks >= 0
     && completeness.complete === (expected.length === 0)
     && completeness.timedOut === expected.includes('timeout')
+    && stageOk
     && sameReasons;
 }
 
 function linksHold(links: DocumentLink[]): boolean {
   return links.every(link => {
     if (typeof link.text !== 'string' || typeof link.url !== 'string') return false;
-    if (link.text.length > LINK_TEXT_LIMIT || link.url.length > 2048 || /[\s#]/.test(link.url)) return false;
+    if (link.text.length > LINK_TEXT_LIMIT || link.url.length > LINK_URL_LIMIT || /[\s#]/.test(link.url)) return false;
     try {
       const url = new URL(link.url);
       return (url.protocol === 'http:' || url.protocol === 'https:') && url.hash === '' && url.href === link.url;

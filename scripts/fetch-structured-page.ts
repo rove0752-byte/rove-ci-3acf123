@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isIP } from 'node:net';
-import { HEADING_LIMIT, LINK_LIMIT, auditCatalog, catalogDocument, verifyExtraction } from '../agent/lib/document-catalog.ts';
+import { HEADING_LIMIT, LINK_LIMIT, auditCatalog, catalogDocument, timeoutFailure, verifyExtraction, type TimeoutStage } from '../agent/lib/document-catalog.ts';
 import { externalAccepts } from '../agent/lib/container-egress.ts';
 import { startIsolatedNetwork } from '../agent/lib/egress-proxy.ts';
 import { publicAddress } from '../agent/lib/public-address.ts';
@@ -77,7 +77,9 @@ try {
     headingsOmitted: catalog.completeness.headingsOmitted,
     linksOmitted: catalog.completeness.linksOmitted,
     sectionsSkipped: catalog.completeness.sectionsSkipped,
+    overlongLinks: catalog.completeness.overlongLinks,
     timedOut: catalog.completeness.timedOut,
+    timeoutStage: catalog.completeness.timeoutStage,
     countsMatch: verification.countsMatch,
     linkIntegrity: verification.linkIntegrity,
     headingLimit: HEADING_LIMIT,
@@ -119,7 +121,15 @@ try {
   event('audit', 'pass', `headings=${catalog.headings.length} links=${catalog.links.length} complete=${catalog.completeness.complete}`);
   process.stdout.write('Structured document fetch passed\n');
 } catch (error) {
-  event('fetch', 'fail', error instanceof Error ? error.message : 'fetch');
+  const message = error instanceof Error ? error.message : 'fetch';
+  if (message === 'Browser operation timed out.' || message.startsWith('Browser operation timed out during ')) {
+    const named = message.includes(' during ') ? message.slice(message.indexOf(' during ') + ' during '.length).replace(/\.$/, '') : 'fetch';
+    const stage: TimeoutStage = named === 'deadline' || named === 'navigation' || named === 'fetch' || named === 'catalog' ? named : 'fetch';
+    const failure = timeoutFailure(stage);
+    event('fetch', 'fail', `timeout stage=${failure.stage}`);
+    throw Object.assign(new Error(`Browser operation timed out during ${failure.stage}.`), failure);
+  }
+  event('fetch', 'fail', message);
   throw error;
 } finally {
   await network.close();
