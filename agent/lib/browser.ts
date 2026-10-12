@@ -125,13 +125,41 @@ export function createBrowserTools(dependencies: {
   const resolve = dependencies.resolve ?? resolvePinned;
   const timeoutMs = dependencies.timeoutMs ?? 30_000;
   const navigationTimeoutMs = dependencies.navigationTimeoutMs ?? 20_000;
+  // Same visit deadline the fetch already races. Accessibility calls do not get a second clock.
+  type ExtractionBudget = { deadlineAt: number; signal: AbortSignal };
 
-  async function visit<T>(raw: string, capture: (page: Page, status: number) => Promise<T>): Promise<T> {
+  function allowedTimeout(budget: ExtractionBudget, limit: number): number {
+    if (budget.signal.aborted) throw new ExtractionTimeout('deadline');
+    const remaining = budget.deadlineAt - Date.now();
+    // Playwright treats timeout 0 as unlimited, so a spent budget must not start the call.
+    if (remaining < 1) throw new ExtractionTimeout('deadline');
+    return Math.min(limit, remaining);
+  }
+
+  function deadlineFailure(error: unknown, budget: ExtractionBudget): unknown {
+    if (error instanceof ExtractionTimeout) return error;
+    if (budget.signal.aborted || Date.now() >= budget.deadlineAt) return new ExtractionTimeout('deadline');
+    if (error instanceof Error && /timeout|timed out/i.test(error.message)) return new ExtractionTimeout('deadline');
+    return error;
+  }
+
+  async function withinDeadline<T>(budget: ExtractionBudget, run: () => Promise<T>): Promise<T> {
+    if (budget.signal.aborted || budget.deadlineAt - Date.now() < 1) throw new ExtractionTimeout('deadline');
+    try {
+      return await run();
+    } catch (error) {
+      throw deadlineFailure(error, budget);
+    }
+  }
+
+  async function visit<T>(raw: string, capture: (page: Page, status: number, budget: ExtractionBudget) => Promise<T>): Promise<T> {
     let browser: Browser | undefined;
     let expired = false;
     let closing: Promise<void> | undefined;
     const close = () => browser ? (closing ??= browser.close()) : Promise.resolve();
     const controller = new AbortController();
+    const deadlineAt = Date.now() + timeoutMs;
+    const budget: ExtractionBudget = { deadlineAt, signal: controller.signal };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -214,7 +242,8 @@ export function createBrowserTools(dependencies: {
         }
         if (!response || response.status() >= 400) throw new Error(`Website returned HTTP ${response?.status() ?? 'unknown'}.`);
         await validate(page.url());
-        return capture(page, response.status());
+        if (expired || budget.signal.aborted || Date.now() >= budget.deadlineAt) throw new ExtractionTimeout('deadline');
+        return capture(page, response.status(), budget);
       }
       throw new Error('Navigation failed.');
     };
@@ -227,7 +256,7 @@ export function createBrowserTools(dependencies: {
 
   async function inspectPage(raw: string) {
     const started = Date.now();
-    return visit(raw, async (page, status) => {
+    return visit(raw, async (page, status, budget) => {
       const content = await page.locator('body').innerText();
       const bounds = extractionBounds();
       // Fixed catalog only. The page supplies data; caller selectors and scripts are not accepted.
@@ -268,7 +297,7 @@ export function createBrowserTools(dependencies: {
       }, bounds);
       const links = extracted.links;
       const headed = extractNavigationHeadings(await page.content());
-      const listed = await inventory(page, status);
+      const listed = await inventory(page, status, budget);
       const textCapped = extracted.textCapped || catalog.textCapped || headed.textCapped || content.length > 18_000;
       const completeness = buildCompleteness({
         headingsKept: headed.headings.length,
@@ -299,37 +328,43 @@ export function createBrowserTools(dependencies: {
     return { complete: reasons.length === 0, kept, omitted, reasons };
   }
 
-  async function inventory(page: Page, status: number) {
+  async function inventory(page: Page, status: number, budget: ExtractionBudget) {
     const roles = ['link', 'button', 'textbox', 'checkbox', 'radio', 'combobox', 'listbox',
       'option', 'slider', 'spinbutton', 'switch', 'tab', 'menuitem', 'searchbox'] as const;
     const elements: { role: string; accessibility: string; disabled: boolean }[] = [];
     let omitted = 0;
     for (const role of roles) {
       const matches = page.getByRole(role);
-      const count = await matches.count();
+      const count = await withinDeadline(budget, () => matches.count());
       for (let index = 0; index < count; index++) {
         const element = matches.nth(index);
-        if (!(await element.isVisible())) continue;
+        if (!(await withinDeadline(budget, () => element.isVisible()))) continue;
         // The 60-element cap stays. Eligible controls after it are counted, not dropped silently.
         if (elements.length >= inventoryLimit) { omitted += 1; continue; }
-        elements.push({ role, accessibility: (await element.ariaSnapshot({ timeout: 1000 })).slice(0, 1000),
-          disabled: await element.isDisabled() });
+        // The 1000ms snapshot cap and the 5000ms action cap stay, and neither can outlive the visit deadline.
+        const accessibility = await withinDeadline(budget, () => element.ariaSnapshot({
+          timeout: allowedTimeout(budget, 1000), signal: budget.signal,
+        }));
+        const disabled = await withinDeadline(budget, () => element.isDisabled({
+          timeout: allowedTimeout(budget, 5000), signal: budget.signal,
+        }));
+        elements.push({ role, accessibility: accessibility.slice(0, 1000), disabled });
       }
     }
     const truncated = omitted > 0;
-    return { evidenceId: randomUUID(), url: page.url(), title: await page.title(), httpStatus: status,
+    return { evidenceId: randomUUID(), url: page.url(), title: await withinDeadline(budget, () => page.title()), httpStatus: status,
       capturedAt: new Date().toISOString(), elements, truncated,
       accessibilityCompleteness: accessibilityCompleteness(elements.length, omitted),
       mode: 'read_only_no_javascript' as const };
   }
 
   function navigate(raw: string) {
-    return visit(raw, inventory);
+    return visit(raw, (page, status, budget) => inventory(page, status, budget));
   }
 
   function snapshotPage(raw: string) {
-    return visit(raw, async (page, status) => {
-      const details = await inventory(page, status);
+    return visit(raw, async (page, status, budget) => {
+      const details = await inventory(page, status, budget);
       const screenshot = await page.screenshot({ type: 'png', timeout: 5000 });
       return { ...details, screenshotBase64: screenshot.toString('base64'),
         screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), screenshotBytes: screenshot.length };

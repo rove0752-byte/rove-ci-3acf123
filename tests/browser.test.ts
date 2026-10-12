@@ -396,6 +396,174 @@ test('public address selection rejects private DNS answers and keeps accepted li
   assert.deepEqual(await resolvePinned(new URL('http://127.0.0.1/path')), [{ address: '127.0.0.1', family: 4 }]);
 });
 
+test('accessibility inspection finishes inside the extraction deadline', async () => {
+  let snapshots = 0;
+  const seen: { timeout: number; aborted: boolean }[] = [];
+  const { tools } = accessibilityTools({
+    buttons: [
+      { visible: true, disabled: false, label: 'Go' },
+      { visible: false, disabled: false, label: 'Hidden control' },
+    ],
+    onSnapshot(call) { snapshots += 1; seen.push(call); },
+  });
+  const result = await tools.inspectPage('http://127.0.0.1/a11y');
+  assert.equal(snapshots, 1);
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0] && seen[0].timeout >= 1 && seen[0].timeout <= 1000);
+  assert.equal(seen[0]?.aborted, false);
+  assert.equal(result.completeness.complete, true);
+  assert.equal(result.completeness.timedOut, false);
+  assert.equal(result.truncated, false);
+  assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: 1, omitted: 0, reasons: [] });
+  assert.equal(Object.hasOwn(result.accessibilityCompleteness, 'total'), false);
+  assert.equal(result.elements, undefined);
+  assert.ok(result.text.includes('Hello'));
+});
+
+test('an ariaSnapshot timeout is a structured deadline failure', async () => {
+  let snapshots = 0;
+  let screenshots = 0;
+  const { tools } = accessibilityTools({
+    buttons: [
+      { visible: true, disabled: false, label: 'First', fail: new Error('Timeout 1000ms exceeded.') },
+      { visible: true, disabled: false, label: 'Second' },
+    ],
+    onSnapshot() { snapshots += 1; },
+    onScreenshot() { screenshots += 1; },
+  });
+  await assert.rejects(tools.inspectPage('http://127.0.0.1/a11y'), (error: unknown) => {
+    assert.ok(error instanceof ExtractionTimeout);
+    assert.equal(error.complete, false);
+    assert.equal(error.failed, true);
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.timedOut, true);
+    assert.equal(error.stage, 'deadline');
+    assert.match(error.message, /timed out/);
+    return true;
+  });
+  assert.equal(snapshots, 1);
+  assert.equal(screenshots, 0);
+});
+
+test('accessibility inspection does not start another snapshot after the deadline', async () => {
+  let snapshots = 0;
+  let visibleChecks = 0;
+  let disabledChecks = 0;
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown) => { unhandled.push(error); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const { tools } = accessibilityTools({
+      timeoutMs: 800,
+      buttons: [
+        { visible: true, disabled: false, label: 'First', waitForAbort: true },
+        { visible: true, disabled: false, label: 'Second' },
+      ],
+      onSnapshot() { snapshots += 1; },
+      onVisible() { visibleChecks += 1; },
+      onDisabled() { disabledChecks += 1; },
+    });
+    await assert.rejects(tools.inspectPage('http://127.0.0.1/a11y'), (error: unknown) => {
+      assert.ok(error instanceof ExtractionTimeout);
+      assert.equal(error.stage, 'deadline');
+      assert.equal(error.complete, false);
+      assert.equal(error.failed, true);
+      assert.equal(error.timedOut, true);
+      assert.match(error.message, /timed out/);
+      return true;
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(snapshots, 1);
+    assert.equal(visibleChecks, 1);
+    assert.equal(disabledChecks, 0);
+    assert.equal(unhandled.length, 0);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+type AccessibilityButton = {
+  visible: boolean;
+  disabled: boolean;
+  label: string;
+  fail?: Error;
+  waitForAbort?: boolean;
+};
+
+function accessibilityTools(options: {
+  timeoutMs?: number;
+  buttons: AccessibilityButton[];
+  onSnapshot?: (call: { timeout: number; aborted: boolean }) => void;
+  onScreenshot?: () => void;
+  onVisible?: () => void;
+  onDisabled?: () => void;
+}) {
+  const page = {
+    on() {},
+    url: () => 'http://127.0.0.1/a11y',
+    async goto() { return { status: () => 200 }; },
+    async title() { return 'Deadline fixture'; },
+    async content() { return '<title>Deadline fixture</title><h1>Hello</h1>'; },
+    async screenshot() { options.onScreenshot?.(); return Buffer.from('png'); },
+    locator() {
+      return {
+        async innerText() { return 'Hello'; },
+        async evaluateAll() { return { links: [], linksOmitted: 0, overlongLinks: 0, textCapped: false }; },
+        async evaluate() { return { description: '', tables: [], jsonLd: [], textCapped: false }; },
+      };
+    },
+    getByRole(role: string) {
+      const buttons = role === 'button' ? options.buttons : [];
+      return {
+        async count() { return buttons.length; },
+        nth(index: number) {
+          const button = buttons[index];
+          return {
+            async isVisible() { options.onVisible?.(); return button?.visible === true; },
+            async isDisabled() { options.onDisabled?.(); return button?.disabled === true; },
+            async ariaSnapshot(args: { timeout?: number; signal?: AbortSignal }) {
+              const call = { timeout: args?.timeout ?? 0, aborted: args?.signal?.aborted === true };
+              options.onSnapshot?.(call);
+              if (!button) throw new Error('snapshot without a button');
+              if (button.fail) throw button.fail;
+              if (button.waitForAbort) {
+                await new Promise((resolve, reject) => {
+                  const signal = args?.signal;
+                  const safety = setTimeout(() => reject(new Error('deadline did not abort the snapshot')), 5_000);
+                  const fail = (error: Error) => { clearTimeout(safety); reject(error); };
+                  if (!signal) { fail(new Error('missing deadline signal')); return; }
+                  if (signal.aborted) { fail(new Error('ariaSnapshot aborted')); return; }
+                  signal.addEventListener('abort', () => fail(new Error('ariaSnapshot aborted')), { once: true });
+                });
+              }
+              return `- button "${button.label}"`;
+            },
+          };
+        },
+      };
+    },
+  };
+  const browser = {
+    on() {},
+    async newContext() {
+      return {
+        setDefaultTimeout() {},
+        setDefaultNavigationTimeout() {},
+        async route() {},
+        async newPage() { return page; },
+      };
+    },
+    async close() {},
+  };
+  const tools = createBrowserTools({
+    timeoutMs: options.timeoutMs ?? 30_000,
+    launch: async () => browser as never,
+    validate: async raw => new URL(raw),
+    resolve: async () => [{ address: '127.0.0.1', family: 4 as const }],
+  });
+  return { tools };
+}
+
 test('startup failure and stalled validation settle without leaking', async () => {
   await assert.rejects(createBrowserTools({ validate: async raw => new URL(raw),
     launch: async () => { throw new Error('startup failed'); },
