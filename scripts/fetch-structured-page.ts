@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isIP } from 'node:net';
-import { HEADING_LIMIT, LINK_LIMIT, auditCatalog, catalogDocument } from '../agent/lib/document-catalog.ts';
+import { HEADING_LIMIT, LINK_LIMIT, auditCatalog, catalogDocument, verifyExtraction } from '../agent/lib/document-catalog.ts';
 import { externalAccepts } from '../agent/lib/container-egress.ts';
 import { startIsolatedNetwork } from '../agent/lib/egress-proxy.ts';
 import { publicAddress } from '../agent/lib/public-address.ts';
@@ -58,23 +58,30 @@ try {
   const html = document.body.toString('utf8');
   const catalog = catalogDocument(html, STRUCTURED_DOCUMENT_URL);
   const audit = auditCatalog(html, STRUCTURED_DOCUMENT_URL, catalog);
+  const verification = verifyExtraction(html, STRUCTURED_DOCUMENT_URL, catalog);
   const location = document.headers.location ?? '';
   const captured = acceptStructuredCapture({
     status: document.status,
     address: pin.address,
     dials: network.dials,
-    auditPass: audit.pass,
+    auditPass: audit.pass && verification.pass,
     location,
   });
   const reliability = {
-    pass: audit.pass,
+    pass: audit.pass && verification.pass,
     mismatches: audit.mismatches,
+    complete: catalog.completeness.complete,
+    reasons: catalog.completeness.reasons,
     headings: catalog.headings.length,
     links: catalog.links.length,
+    headingsOmitted: catalog.completeness.headingsOmitted,
+    linksOmitted: catalog.completeness.linksOmitted,
+    sectionsSkipped: catalog.completeness.sectionsSkipped,
+    timedOut: catalog.completeness.timedOut,
+    countsMatch: verification.countsMatch,
+    linkIntegrity: verification.linkIntegrity,
     headingLimit: HEADING_LIMIT,
     linkLimit: LINK_LIMIT,
-    atHeadingLimit: catalog.headings.length >= HEADING_LIMIT,
-    atLinkLimit: catalog.links.length >= LINK_LIMIT,
     sha256: createHash('sha256').update(document.body).digest('hex'),
   };
   writeFileSync(`${evidence}/document.html`, document.body);
@@ -105,11 +112,11 @@ try {
     prohibited: ['click', 'form', 'authentication', 'purchase', 'customer-access', 'deploy', 'paid-api'],
   }, null, 2));
   if (!captured) {
-    event('fetch', 'fail', `status=${document.status} audit=${audit.pass} dials=${network.dials.length}`);
+    event('fetch', 'fail', `status=${document.status} audit=${audit.pass} verify=${verification.pass} dials=${network.dials.length}`);
     process.exit(1);
   }
   event('fetch', 'pass', `status=${document.status}`);
-  event('audit', 'pass', `headings=${catalog.headings.length} links=${catalog.links.length}`);
+  event('audit', 'pass', `headings=${catalog.headings.length} links=${catalog.links.length} complete=${catalog.completeness.complete}`);
   process.stdout.write('Structured document fetch passed\n');
 } catch (error) {
   event('fetch', 'fail', error instanceof Error ? error.message : 'fetch');

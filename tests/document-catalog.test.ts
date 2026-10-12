@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { auditCatalog, catalogDocument, type DocumentCatalog } from '../agent/lib/document-catalog.ts';
+import {
+  HEADING_LIMIT,
+  LINK_LIMIT,
+  auditCatalog,
+  catalogDocument,
+  verifyExtraction,
+  type DocumentCatalog,
+} from '../agent/lib/document-catalog.ts';
 
 const page = `<!doctype html>
 <html lang="en">
@@ -44,6 +52,16 @@ const expected: DocumentCatalog = {
     robots: 'noindex',
     ogTitle: 'Guide',
   },
+  completeness: {
+    complete: true,
+    reasons: [],
+    headingsKept: 2,
+    headingsOmitted: 0,
+    linksKept: 3,
+    linksOmitted: 0,
+    sectionsSkipped: 0,
+    timedOut: false,
+  },
 };
 
 test('catalog fields match the retrieved document', () => {
@@ -52,6 +70,11 @@ test('catalog fields match the retrieved document', () => {
   const audit = auditCatalog(page, 'https://docs.example/start', catalog);
   assert.equal(audit.pass, true);
   assert.deepEqual(audit.mismatches, []);
+  const check = verifyExtraction(page, 'https://docs.example/start', catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, true);
+  assert.equal(check.countsMatch, true);
+  assert.equal(check.linkIntegrity, true);
 });
 
 test('a catalog that adds or drops document fields fails the audit', () => {
@@ -63,6 +86,7 @@ test('a catalog that adds or drops document fields fails the audit', () => {
     const audit = auditCatalog(page, 'https://docs.example/start', altered);
     assert.equal(audit.pass, false);
     assert.ok(audit.mismatches.length > 0);
+    assert.equal(verifyExtraction(page, 'https://docs.example/start', altered).pass, false);
   }
 });
 
@@ -71,6 +95,7 @@ test('relative links use the document URL when no base is declared', () => {
   const catalog = catalogDocument(html, 'https://docs.example/dir/page');
   assert.deepEqual(catalog.links, [{ text: 'Local', url: 'https://docs.example/dir/local.html' }]);
   assert.equal(auditCatalog(html, 'https://docs.example/dir/page', catalog).pass, true);
+  assert.equal(catalog.completeness.complete, true);
 });
 
 test('a local stand-in for the reviewed Python docs outline matches its own audit', () => {
@@ -123,6 +148,8 @@ test('a local stand-in for the reviewed Python docs outline matches its own audi
   const mismatch = auditCatalog(html, page, dropped);
   assert.equal(mismatch.pass, false);
   assert.equal(mismatch.mismatches.some(item => item.field === 'links'), true);
+  assert.equal(verifyExtraction(html, page, catalog).pass, true);
+  assert.equal(verifyExtraction(html, page, dropped).pass, false);
 });
 
 test('long title text is bounded and still matches the document', () => {
@@ -130,5 +157,167 @@ test('long title text is bounded and still matches the document', () => {
   const html = `<title>${title}</title>`;
   const catalog = catalogDocument(html, 'https://docs.example/');
   assert.equal(catalog.title, title.slice(0, 300));
+  assert.equal(catalog.completeness.complete, false);
+  assert.deepEqual(catalog.completeness.reasons, ['text-cap']);
   assert.equal(auditCatalog(html, 'https://docs.example/', catalog).pass, true);
+  const check = verifyExtraction(html, 'https://docs.example/', catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, false);
+});
+
+test('long link urls are kept whole', () => {
+  const path = `/path/${'a'.repeat(180)}`;
+  const html = `<title>U</title><a href="${path}">Go</a>`;
+  const catalog = catalogDocument(html, 'https://docs.example/');
+  assert.equal(catalog.links[0]?.url, `https://docs.example${path}`);
+  assert.equal(catalog.completeness.complete, true);
+  assert.equal(verifyExtraction(html, 'https://docs.example/', catalog).linkIntegrity, true);
+});
+
+test('links past the safety cap are reported as omitted', () => {
+  const count = LINK_LIMIT + 3;
+  const anchors = Array.from({ length: count }, (_, index) => `<a href="https://docs.example/p/${index}">P${index}</a>`).join('');
+  const html = `<title>Many</title><h1>Many</h1>${anchors}`;
+  const catalog = catalogDocument(html, 'https://docs.example/');
+  assert.equal(catalog.links.length, LINK_LIMIT);
+  assert.equal(catalog.completeness.linksKept, LINK_LIMIT);
+  assert.equal(catalog.completeness.linksOmitted, 3);
+  assert.equal(catalog.completeness.complete, false);
+  assert.deepEqual(catalog.completeness.reasons, ['link-cap']);
+  assert.equal(catalog.links[0]?.url, 'https://docs.example/p/0');
+  assert.equal(catalog.links.at(-1)?.url, `https://docs.example/p/${LINK_LIMIT - 1}`);
+  const check = verifyExtraction(html, 'https://docs.example/', catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, false);
+  assert.equal(check.countsMatch, true);
+  assert.equal(check.linkIntegrity, true);
+  const hidden = {
+    ...catalog,
+    links: catalog.links.slice(0, 10),
+    completeness: { ...catalog.completeness, complete: true, reasons: [], linksKept: 10, linksOmitted: 0 },
+  };
+  assert.equal(verifyExtraction(html, 'https://docs.example/', hidden).pass, false);
+});
+
+test('headings past the safety cap are reported as omitted', () => {
+  const count = HEADING_LIMIT + 2;
+  const blocks = Array.from({ length: count }, (_, index) => `<h2>Part ${index}</h2>`).join('');
+  const html = `<title>Outline</title>${blocks}`;
+  const catalog = catalogDocument(html, 'https://docs.example/');
+  assert.equal(catalog.headings.length, HEADING_LIMIT);
+  assert.equal(catalog.completeness.headingsOmitted, 2);
+  assert.equal(catalog.completeness.complete, false);
+  assert.ok(catalog.completeness.reasons.includes('heading-cap'));
+  assert.equal(catalog.headings.at(-1)?.text, `Part ${HEADING_LIMIT - 1}`);
+  const check = verifyExtraction(html, 'https://docs.example/', catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, false);
+});
+
+test('repeated nav headings collapse and real headings stay', () => {
+  const html = `<!doctype html>
+<html><head><title>Outline</title></head><body>
+<nav>
+  <h3>Download</h3>
+  <h3>Docs by version</h3>
+</nav>
+<h1>Python 3.15.0 documentation</h1>
+<h2>Other resources</h2>
+<h3>Download</h3>
+<h2>Notes</h2>
+<h2>Notes</h2>
+<div class="sphinxsidebar" role="Navigation">
+  <h3>Download</h3>
+  <h3>Docs by version</h3>
+</div>
+<a href="https://docs.example/keep">Keep</a>
+</body></html>`;
+  const catalog = catalogDocument(html, 'https://docs.example/');
+  assert.deepEqual(catalog.headings, [
+    { level: 'h3', text: 'Download' },
+    { level: 'h3', text: 'Docs by version' },
+    { level: 'h1', text: 'Python 3.15.0 documentation' },
+    { level: 'h2', text: 'Other resources' },
+    { level: 'h3', text: 'Download' },
+    { level: 'h2', text: 'Notes' },
+    { level: 'h2', text: 'Notes' },
+  ]);
+  assert.deepEqual(catalog.links, [{ text: 'Keep', url: 'https://docs.example/keep' }]);
+  assert.equal(catalog.completeness.complete, true);
+  assert.equal(catalog.completeness.headingsOmitted, 0);
+  const check = verifyExtraction(html, 'https://docs.example/', catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, true);
+});
+
+test('an unclosed section is incomplete', () => {
+  const html = '<title>Cut</title><h1>Kept</h1><a href="https://docs.example/ok">Ok</a><a href="https://docs.example/cut">Cut<h2>Open';
+  const catalog = catalogDocument(html, 'https://docs.example/');
+  assert.deepEqual(catalog.headings, [{ level: 'h1', text: 'Kept' }]);
+  assert.deepEqual(catalog.links, [{ text: 'Ok', url: 'https://docs.example/ok' }]);
+  assert.ok(catalog.completeness.sectionsSkipped >= 1);
+  assert.equal(catalog.completeness.complete, false);
+  assert.ok(catalog.completeness.reasons.includes('section-skipped'));
+  const check = verifyExtraction(html, 'https://docs.example/', catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, false);
+});
+
+test('a timeout is recorded on the catalog', () => {
+  const catalog = catalogDocument(page, 'https://docs.example/start', { timedOut: true });
+  assert.equal(catalog.completeness.timedOut, true);
+  assert.equal(catalog.completeness.complete, false);
+  assert.deepEqual(catalog.completeness.reasons, ['timeout']);
+  const check = verifyExtraction(page, 'https://docs.example/start', catalog, { timedOut: true });
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, false);
+  assert.equal(verifyExtraction(page, 'https://docs.example/start', catalog).pass, false);
+});
+
+test('the saved Python docs page keeps footer links and one copy of each nav heading', () => {
+  const html = readFileSync(new URL('../reports/readonly-pilot/structured/document.html', import.meta.url), 'utf8');
+  const saved = JSON.parse(readFileSync(new URL('../reports/readonly-pilot/structured/catalog.json', import.meta.url), 'utf8')) as {
+    links: { url: string }[];
+    headings: { text: string }[];
+  };
+  const pageUrl = 'https://docs.python.org/3/';
+  const catalog = catalogDocument(html, pageUrl);
+  assert.equal(saved.links.length, 60);
+  assert.equal(saved.links.some(link => link.url === 'https://www.sphinx-doc.org/'), false);
+  assert.ok(catalog.links.length > saved.links.length);
+  assert.equal(catalog.completeness.linksOmitted, 0);
+  assert.equal(catalog.completeness.headingsOmitted, 0);
+  for (const url of [
+    'https://www.sphinx-doc.org/',
+    'https://www.python.org/psf/donations/',
+    'https://docs.python.org/license.html',
+    'https://docs.python.org/bugs.html',
+  ]) {
+    assert.equal(catalog.links.some(link => link.url === url), true, url);
+  }
+  assert.ok(catalog.links.filter(link => link.url === 'https://docs.python.org/3/download.html').length >= 2);
+  assert.deepEqual(catalog.headings, [
+    { level: 'h3', text: 'Download' },
+    { level: 'h3', text: 'Docs by version' },
+    { level: 'h3', text: 'Other resources' },
+    { level: 'h3', text: 'Navigation' },
+    { level: 'h1', text: 'Python 3.15.0 documentation' },
+  ]);
+  assert.equal(catalog.headings.filter(heading => heading.text === 'Download').length, 1);
+  assert.equal(saved.headings.filter(heading => heading.text === 'Download').length, 2);
+  const check = verifyExtraction(html, pageUrl, catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, true);
+  assert.equal(check.countsMatch, true);
+  assert.equal(check.linkIntegrity, true);
+  assert.equal(auditCatalog(html, pageUrl, catalog).pass, true);
+});
+
+test('document fetch records extraction verification', () => {
+  const fetchSource = readFileSync(new URL('../scripts/fetch-structured-page.ts', import.meta.url), 'utf8');
+  const hostSource = readFileSync(new URL('../scripts/run-structured-fetch.ts', import.meta.url), 'utf8');
+  assert.equal(fetchSource.includes('verifyExtraction('), true);
+  assert.equal(hostSource.includes('verifyExtraction('), true);
+  assert.equal(fetchSource.includes('linksOmitted'), true);
+  assert.equal(hostSource.includes('linksOmitted'), true);
 });

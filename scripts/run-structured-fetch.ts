@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { HEADING_LIMIT, LINK_LIMIT, auditCatalog, catalogDocument, type DocumentCatalog } from '../agent/lib/document-catalog.ts';
+import { HEADING_LIMIT, LINK_LIMIT, auditCatalog, catalogDocument, verifyExtraction, type DocumentCatalog } from '../agent/lib/document-catalog.ts';
 import { createStructuredNetwork, readEvidence, resolveStructuredHost, runStructuredContainer } from './structured-container.ts';
 import { STRUCTURED_DOCUMENT_URL, acceptStructuredCapture } from './structured-document.ts';
 
@@ -53,9 +53,10 @@ try {
   const decoded = html.toString('utf8');
   const hostAudit = auditCatalog(decoded, STRUCTURED_DOCUMENT_URL, catalog);
   const rebuilt = catalogDocument(decoded, STRUCTURED_DOCUMENT_URL);
+  const verification = verifyExtraction(decoded, STRUCTURED_DOCUMENT_URL, catalog);
   const sha256 = createHash('sha256').update(html).digest('hex');
   const catalogMatchesWalker = JSON.stringify(rebuilt) === JSON.stringify(catalog);
-  const independent = hostAudit.pass && catalogMatchesWalker && sha256 === result.sha256 &&
+  const independent = hostAudit.pass && verification.pass && catalogMatchesWalker && sha256 === result.sha256 &&
     sha256 === containerReliability.sha256 && containerReliability.pass === true &&
     acceptStructuredCapture({
       status: result.status ?? 0,
@@ -72,14 +73,21 @@ try {
     independent: true,
     containerPass: containerReliability.pass === true,
     hostPass: hostAudit.pass,
+    verified: verification.pass,
+    complete: rebuilt.completeness.complete,
+    reasons: rebuilt.completeness.reasons,
     catalogMatchesWalker,
     sha256,
     headings: rebuilt.headings.length,
     links: rebuilt.links.length,
+    headingsOmitted: rebuilt.completeness.headingsOmitted,
+    linksOmitted: rebuilt.completeness.linksOmitted,
+    sectionsSkipped: rebuilt.completeness.sectionsSkipped,
+    timedOut: rebuilt.completeness.timedOut,
+    countsMatch: verification.countsMatch,
+    linkIntegrity: verification.linkIntegrity,
     headingLimit: HEADING_LIMIT,
     linkLimit: LINK_LIMIT,
-    atHeadingLimit: rebuilt.headings.length >= HEADING_LIMIT,
-    atLinkLimit: rebuilt.links.length >= LINK_LIMIT,
   };
   writeFileSync(resolve(reportDir, 'reliability.json'), JSON.stringify(reliability, null, 2));
   if (run.status !== 0 || !run.stdout.includes('Structured document fetch passed') || !independent) {
