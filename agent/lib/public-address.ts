@@ -24,5 +24,6 @@ export function publicAddress(address: string): boolean {
   }
   if (isIP(address) !== 6) return false;
   const canonical = canonicalIpv6(address);
-  return canonical !== null && /^2[0-9a-f]{3}:/.test(canonical) && !/^2001:(?:db8|0|2):/.test(canonical);
+  // 6to4 (2002::/16) embeds an IPv4 address in bits 16-47, so it is never treated as public.
+  return canonical !== null && /^2[0-9a-f]{3}:/.test(canonical) && !/^2001:(?:db8|0|2):/.test(canonical) && !/^2002:/.test(canonical);
 }
