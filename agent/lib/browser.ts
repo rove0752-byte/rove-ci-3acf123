@@ -570,4 +570,5 @@ export function collectStructures(root: StructureRoot, bounds: { metaLimit: numb
   };
 }
 
-export const { inspectPage, navigate, snapshotPage } = createBrowserTools();
+// `stop` is the in-process kill switch for the shared default tools (used by the API and harness signal handlers).
+export const { inspectPage, navigate, snapshotPage, stop } = createBrowserTools();
