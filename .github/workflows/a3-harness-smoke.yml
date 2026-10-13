@@ -4,20 +4,26 @@ permissions: { contents: read }
 jobs:
   smoke:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with: { persist-credentials: false }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 24, cache: npm }
-      - run: sudo apt-get install -y zsh
+      - run: sudo apt-get update && sudo apt-get install -y zsh
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       # Harness runs with no network: a fresh net namespace with only loopback up. Local fixtures only.
+      # All values are expanded by the runner shell and passed as arguments, so sudo's env_reset does not matter.
       - name: Harness smoke (network none)
         run: |
-          sudo unshare --net -- sh -c 'ip link set lo up && ! curl -s -m 3 https://example.com >/dev/null && \
-            setpriv --reuid=$(id -u runner) --regid=$(id -g runner) --init-groups env HOME=$HOME PATH=$PATH \
-            sh -c "node --experimental-strip-types harness/a3-local/run.ts $RUNNER_TEMP/a3 && node --experimental-strip-types harness/a3-local/score.ts $RUNNER_TEMP/a3"'
-      - name: Safety regression (no Docker on CI; container test skips)
-        run: node --experimental-strip-types --test harness/a3-local/tests/safety.test.ts
+          set -e; NODE="$(command -v node)"; OUT="$RUNNER_TEMP/a3"
+          sudo unshare --net -- sh -c 'ip link set lo up && ! getent hosts example.com >/dev/null && exec "$@"' sh \
+            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+            env -i HOME="$HOME" PATH="$(dirname "$NODE"):/usr/bin:/bin" PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+            sh -c "\"$NODE\" --experimental-strip-types harness/a3-local/run.ts \"$OUT\" && \"$NODE\" --experimental-strip-types harness/a3-local/score.ts \"$OUT\""
+      # Unit + safety + runner suites. Docker-image-dependent tests report as skipped on CI (images are local-only).
+      - name: All test suites
+        run: npm run test:all

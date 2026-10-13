@@ -15,6 +15,7 @@
     "typecheck": "tsc",
     "preview": "node --experimental-strip-types scripts/preview.ts",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:all": "npm test && npm run test:a3-safety",
     "test:a3-safety": "node --experimental-strip-types --test harness/a3-local/tests/safety.test.ts",
     "test:stage-a-runner": "node --experimental-strip-types --test --test-concurrency=1 harness/stage-a-runner/tests/runner.test.ts",
     "test:schema": "node --experimental-strip-types scripts/verify-eve-output-schema.mjs",
