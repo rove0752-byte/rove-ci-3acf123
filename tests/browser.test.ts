@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { Browser } from 'playwright';
-import { ExtractionTimeout, accessibilityDeadline, UnexpectedNavigation, createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
+import { BrowserStopped, ExtractionTimeout, accessibilityDeadline, UnexpectedNavigation, createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
 import { HEADING_LIMIT, catalogDocument } from '../agent/lib/document-catalog.ts';
 import { validateUrl } from '../agent/lib/policy.ts';
 
@@ -763,3 +763,12 @@ test('a page left on a browser error page or another URL is a structured failure
 function createBoundedSnapshot(tools: ReturnType<typeof createBrowserTools>) {
   return tools.snapshotPage('http://127.0.0.1/a11y');
 }
+
+test('integration: the kill switch during the accessibility inventory fails the visit, never a partial result', async () => {
+  const { tools } = accessibilityTools({ buttons: [{ visible: true, disabled: false, label: 'Hold', waitForAbort: true }] });
+  const visit = tools.snapshotPage('http://127.0.0.1/a11y');
+  void visit.catch(() => {});
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(await tools.stop(), 1);
+  await assert.rejects(visit, (error: unknown) => error instanceof BrowserStopped);
+});
