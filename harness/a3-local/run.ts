@@ -40,6 +40,7 @@ const hits: string[] = [];
 const server = createServer((req, res) => {
   hits.push(req.url ?? '');
   const name = (req.url ?? '/').replace(/^\//, '').split('?')[0];
+  if (name === 'hang') return; // deliberately never responds (kill-switch tests only)
   const file = join(here, 'fixtures', `${name}.html`);
   if (!/^[a-z]+$/.test(name) || !existsSync(file)) { res.writeHead(404); res.end(); return; }
   res.setHeader('content-type', 'text/html'); res.end(readFileSync(file));
