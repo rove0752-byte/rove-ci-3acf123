@@ -9,15 +9,20 @@ MYPG=$(ps -o pgid= -p $$ | tr -d ' '); PARENTPG=$(ps -o pgid= -p $PPID | tr -d '
 rc=0
 stop_one() {
   local name=$1 f="$A3_REGISTRY/$1"
+  if [[ ! "$name" =~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' ]]; then a3_log "refuse reason=bad-name"; echo "refused: bad name"; rc=3; return; fi
   [ -f "$f" ] || { a3_log "refuse name=$name reason=not-registered"; echo "refused: $name not registered"; rc=3; return; }
   local line=$(<"$f"); local type=${${line#type=}%% *}
   if [ "$type" = docker ]; then
     local cname=${${line#*container=}%% *}
+    if [[ ! "$cname" =~ '^rove-a3-[0-9]+-[0-9]+$' ]] || [ "$(docker inspect -f '{{index .Config.Labels "rove.a3"}}' "$cname" 2>/dev/null)" != 1 ]; then
+      a3_log "refuse name=$name reason=container-not-ours"; echo "refused: $name (container-not-ours)"; rc=4; return; fi
     a3_log "kill name=$name container=$cname signal=KILL"
     docker kill "$cname" >/dev/null 2>&1; docker rm "$cname" >/dev/null 2>&1   # --rm also removes; this covers a missed --rm
     a3_log "killed name=$name container=$cname"
   else
     local pid=${${line#*pid=}%% *} pg=${${line#*pgid=}%% *}
+    local started=${${line#*lstart=}%%;*}
+    if [[ ! "$pid" =~ '^[0-9]+$' || ! "$pg" =~ '^[0-9]+$' || "$line" != *lstart=*\;* ]]; then a3_log "refuse name=$name reason=malformed-entry"; echo "refused: $name (malformed)"; rc=4; return; fi
     if [ "$pid" -le 1 -o "$pg" -le 1 ]; then a3_log "refuse name=$name pid=$pid pgid=$pg reason=pid1"; echo "refused: $name (pid1)"; rc=4; return; fi
     if ! ps -p $pid >/dev/null 2>&1; then a3_log "gone name=$name pid=$pid"; rm -f "$f"; return; fi
     local cur=$(ps -o pgid= -p $pid | tr -d ' ')
@@ -27,6 +32,7 @@ stop_one() {
     [ "$pg" = "$PARENTPG" ] && reason="parent-pgid"
     [ "$pid" = 1 -o "$pg" = 1 -o "$pg" = 0 ] && reason="pid1"
     [ "$pg" != "$pid" ] && reason="${reason:-not-group-leader}"
+    [ "$(ps -o lstart= -p $pid)" != "$started" ] && reason="start-time-mismatch"   # PID reuse
     [[ "$(ps -o stat= -p $pid)" == *s* ]] && reason="session-leader"   # ps STAT 's' = session leader
     if [ -n "$reason" ]; then a3_log "refuse name=$name pid=$pid pgid=$pg reason=$reason"; echo "refused: $name ($reason)"; rc=4; return; fi
     a3_log "kill name=$name pgid=$pg signal=TERM"

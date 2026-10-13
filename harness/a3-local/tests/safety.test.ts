@@ -15,7 +15,7 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catc
 const pgidOf = (pid: number) => Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim());
 const killLog = () => existsSync(env.A3_KILL_LOG) ? readFileSync(env.A3_KILL_LOG, 'utf8') : '';
 const register = (name: string, pid: number, pgid: number) => {
-  execFileSync('zsh', ['-c', `source ${join(here, 'registry.sh')}; a3_init; print -r -- "type=pgid pid=${pid} pgid=${pgid}" > "$A3_REGISTRY/${name}"`], { env });
+  execFileSync('zsh', ['-c', `source ${join(here, 'registry.sh')}; a3_init; print -r -- "type=pgid pid=${pid} pgid=${pgid} lstart=$(ps -o lstart= -p ${pid});" > "$A3_REGISTRY/${name}"`], { env });
 };
 const docker = spawnSync('docker', ['image', 'inspect', 'rove-browser-pilot:local']).status === 0;
 
@@ -91,4 +91,26 @@ test('container runs use --rm, keep logs, and the wall-clock kill is logged', { 
   const left = spawnSync('docker', ['ps', '-a', '-q', '--filter', 'label=rove.a3=1'], { encoding: 'utf8' }).stdout.trim();
   assert.equal(left, '', 'no containers left behind');
   assert.deepEqual(readdirSync(env.A3_REGISTRY).filter(n => n.startsWith('rove-a3-')), [], 'container registry entries cleaned');
+});
+
+test('security: path traversal, malformed entries, foreign containers and PID reuse are refused', { timeout: 30_000 }, () => {
+  execFileSync('zsh', ['-c', `source ${join(here, 'registry.sh')}; a3_log seed`], { env });
+  assert.equal(sh('kill.sh', ['../kill.log']).status, 3);
+  assert.match(killLog(), /seed/, 'kill log not deleted via traversal');
+  writeFileSync(join(env.A3_REGISTRY, 'bad'), 'type=pgid pid=abc pgid=abc\n');
+  assert.equal(sh('kill.sh', ['bad']).status, 4);
+  const reused = spawn('perl', ['-e', 'setpgrp(0,0); sleep 60'], { stdio: 'ignore' });
+  spawnSync('sleep', ['0.3']);
+  writeFileSync(join(env.A3_REGISTRY, 'reuse'), `type=pgid pid=${reused.pid} pgid=${reused.pid} lstart=Thu Jan  1 00:00:00 1970;\n`);
+  assert.equal(sh('kill.sh', ['reuse']).status, 4);
+  assert.ok(alive(reused.pid!), 'process with recycled pid survives');
+  reused.kill('SIGKILL');
+  if (docker) {
+    spawnSync('docker', ['run', '-d', '--rm', '--name', 'a3sec-foreign', '--network', 'none', 'rove-browser-pilot:local', 'sleep', '30']);
+    writeFileSync(join(env.A3_REGISTRY, 'foreign'), 'type=docker container=a3sec-foreign\n');
+    assert.equal(sh('kill.sh', ['foreign']).status, 4);
+    assert.equal(spawnSync('docker', ['ps', '-q', '--filter', 'name=a3sec-foreign'], { encoding: 'utf8' }).stdout.trim().length > 0, true, 'foreign container untouched');
+    spawnSync('docker', ['kill', 'a3sec-foreign']);
+  }
+  assert.match(killLog(), /reason=bad-name/); assert.match(killLog(), /reason=malformed-entry/); assert.match(killLog(), /reason=start-time-mismatch/);
 });
