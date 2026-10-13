@@ -1,6 +1,15 @@
 {
   "allow": ["allowed.test", "other.test", "private.test", "rebind.test", "mixed.test"],
-  "rate": { "perSecond": 2, "burst": 6 },
+  "rate": { "perSecond": 2, "burst": 6, "queueMs": 5000 },
+  "crossOrigin": {
+    "offListSubresource": "block",
+    "aClassMax": 20,
+    "sameOffListHostMax": 5,
+    "sameOffListWindowMs": 60000,
+    "topLevelRobotsConsecutive": 3,
+    "bodyCapBytes": 5000000,
+    "bodyCapOccasions": 3
+  },
   "dns": {
     "allowed.test": ["45.0.0.10"],
     "other.test": ["45.0.0.10"],
