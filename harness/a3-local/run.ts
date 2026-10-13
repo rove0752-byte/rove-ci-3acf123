@@ -12,14 +12,15 @@ const here = dirname(fileURLToPath(import.meta.url));
 const OUT = process.argv[2] ?? join(here, 'evidence', new Date().toISOString().replace(/[:.]/g, '-'));
 const KILL_FILE = process.env.A3_KILL_FILE ?? join(OUT, 'KILL');
 const PAGES = (process.env.A3_PAGES ?? 'simple,links,jsonld,table,nav').split(',');
-try { mkdirSync(join(OUT, 'screenshots'), { recursive: true }); } catch (error) { console.error(`EVIDENCE DIR FAILED: ${(error as Error).message}`); process.exit(2); }
+process.umask(0o077);
+try { mkdirSync(join(OUT, 'screenshots'), { recursive: true, mode: 0o700 }); } catch (error) { console.error(`EVIDENCE DIR FAILED: ${(error as Error).message}`); process.exit(2); }
 const manifest = join(OUT, 'SHA256SUMS');
 const sums = new Map<string, string>();
 
 function save(name: string, data: string | Buffer) {
   const path = join(OUT, name);
   try {
-    writeFileSync(path, data);
+    writeFileSync(path, data, { mode: 0o600 });
     const fd = openSync(path, 'r'); fsyncSync(fd); closeSync(fd);
     const want = createHash('sha256').update(data).digest('hex');
     const got = createHash('sha256').update(readFileSync(path)).digest('hex');
