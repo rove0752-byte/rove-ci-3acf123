@@ -7,7 +7,7 @@ export type DocumentMetadata = {
   robots: string;
   ogTitle: string;
 };
-export type CompletenessReason = 'link-cap' | 'heading-cap' | 'section-skipped' | 'text-cap' | 'overlong-link' | 'jsonld-cap' | 'table-cap' | 'timeout';
+export type CompletenessReason = 'link-cap' | 'heading-cap' | 'section-skipped' | 'text-cap' | 'overlong-link' | 'jsonld-cap' | 'jsonld-invalid' | 'table-cap' | 'timeout';
 export type TimeoutStage = 'deadline' | 'navigation' | 'fetch' | 'catalog';
 export type ExtractionCompleteness = {
   complete: boolean;
@@ -23,6 +23,7 @@ export type ExtractionCompleteness = {
   // Present on browser inspect. Catalog pages do not extract JSON-LD or tables.
   jsonLdKept?: number;
   jsonLdOmitted?: number;
+  jsonLdInvalid?: number;
   rowsKept?: number;
   rowsOmitted?: number;
   cellsKept?: number;
@@ -81,6 +82,7 @@ export function buildCompleteness(counts: {
   timeoutStage?: TimeoutStage | null;
   jsonLdKept?: number;
   jsonLdOmitted?: number;
+  jsonLdInvalid?: number;
   rowsKept?: number;
   rowsOmitted?: number;
   cellsKept?: number;
@@ -93,6 +95,7 @@ export function buildCompleteness(counts: {
   if (counts.textCapped) reasons.push('text-cap');
   if (counts.overlongLinks > 0) reasons.push('overlong-link');
   if ((counts.jsonLdOmitted ?? 0) > 0) reasons.push('jsonld-cap');
+  if ((counts.jsonLdInvalid ?? 0) > 0) reasons.push('jsonld-invalid');
   if ((counts.rowsOmitted ?? 0) > 0 || (counts.cellsOmitted ?? 0) > 0) reasons.push('table-cap');
   const timedOut = counts.timedOut === true;
   if (timedOut) reasons.push('timeout');
@@ -112,6 +115,7 @@ export function buildCompleteness(counts: {
   if (counts.jsonLdOmitted !== undefined || counts.rowsOmitted !== undefined || counts.cellsOmitted !== undefined) {
     completeness.jsonLdKept = counts.jsonLdKept ?? 0;
     completeness.jsonLdOmitted = counts.jsonLdOmitted ?? 0;
+    completeness.jsonLdInvalid = counts.jsonLdInvalid ?? 0;
     completeness.rowsKept = counts.rowsKept ?? 0;
     completeness.rowsOmitted = counts.rowsOmitted ?? 0;
     completeness.cellsKept = counts.cellsKept ?? 0;
@@ -490,6 +494,7 @@ function countsMatch(catalog: DocumentCatalog): boolean {
   if (completeness.reasons.includes('text-cap')) expected.push('text-cap');
   if (completeness.overlongLinks > 0) expected.push('overlong-link');
   if ((completeness.jsonLdOmitted ?? 0) > 0) expected.push('jsonld-cap');
+  if ((completeness.jsonLdInvalid ?? 0) > 0) expected.push('jsonld-invalid');
   if ((completeness.rowsOmitted ?? 0) > 0 || (completeness.cellsOmitted ?? 0) > 0) expected.push('table-cap');
   if (completeness.timedOut) expected.push('timeout');
   const sameReasons = completeness.reasons.length === expected.length

@@ -168,12 +168,15 @@ test('real browser: startup, discovery, inspect protections, redirects, timeouts
       assert.equal(result.structured.description, 'Fixture description');
       assert.deepEqual(result.structured.headings, [{ level: 'h1', text: 'Fixture heading' }]);
       assert.ok(result.structured.links.some(link => link.url === `${origin}/next`));
-      assert.equal(result.completeness.complete, true);
+      // The fixture's second ld+json block is "not json": it is counted as invalid, so the page is incomplete.
+      assert.equal(result.completeness.complete, false);
+      assert.deepEqual(result.completeness.reasons, ['jsonld-invalid']);
+      assert.equal(result.completeness.jsonLdInvalid, 1);
       assert.equal(result.completeness.linksOmitted, 0);
       assert.equal(result.completeness.overlongLinks, 0);
       assert.equal(result.completeness.timedOut, false);
       assert.equal(result.completeness.timeoutStage, null);
-      assert.equal(result.structured.completeness.complete, true);
+      assert.equal(result.structured.completeness.complete, false);
       assert.deepEqual(result.accessibilityCompleteness, { complete: true, kept: 10, omitted: 0, reasons: [] });
       assert.equal(result.links.length, result.structured.links.length);
       assert.deepEqual(result.structured.tables, [[['Column'], ['Cell']]]);

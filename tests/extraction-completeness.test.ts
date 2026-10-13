@@ -85,6 +85,7 @@ function completenessFor(result: ReturnType<typeof structures>) {
     overlongLinks: 0,
     jsonLdKept: result.jsonLdKept,
     jsonLdOmitted: result.jsonLdOmitted,
+    jsonLdInvalid: result.jsonLdInvalid,
     rowsKept: result.rowsKept,
     rowsOmitted: result.rowsOmitted,
     cellsKept: result.cellsKept,
@@ -128,9 +129,11 @@ test('a JSON-LD block over 20000 characters is omitted and its content is not st
   assert.equal(JSON.stringify(result.jsonLd).includes('Q'), false);
   const completeness = completenessFor(result);
   assert.equal(completeness.complete, false);
-  assert.deepEqual(completeness.reasons, ['jsonld-cap']);
+  // 'not-json' is invalid, the two empty blocks are not counted.
+  assert.deepEqual(completeness.reasons, ['jsonld-cap', 'jsonld-invalid']);
   assert.equal(completeness.jsonLdKept, 5);
   assert.equal(completeness.jsonLdOmitted, 1);
+  assert.equal(completeness.jsonLdInvalid, 1);
 });
 
 test('a sixth JSON-LD block is omitted without raising the five-block cap', () => {
@@ -212,7 +215,7 @@ test('cell text over 200 characters is sliced and is not an omitted cell', () =>
 
 test('catalog completeness stays unchanged when JSON-LD and table counts are absent', () => {
   const catalog = buildCompleteness(catalogCounts);
-  for (const key of ['jsonLdKept', 'jsonLdOmitted', 'rowsKept', 'rowsOmitted', 'cellsKept', 'cellsOmitted']) {
+  for (const key of ['jsonLdKept', 'jsonLdOmitted', 'jsonLdInvalid', 'rowsKept', 'rowsOmitted', 'cellsKept', 'cellsOmitted']) {
     assert.equal(Object.hasOwn(catalog, key), false);
   }
   assert.equal(catalog.complete, true);
@@ -281,4 +284,34 @@ test('inspect reports omitted JSON-LD and table rows without storing them', asyn
   assert.equal(result.structured.tables[0]?.length, 20);
   assert.equal(JSON.stringify(result.structured.tables).includes('omit-row'), false);
   assert.equal(result.structured.completeness.complete, false);
+});
+
+test('an ld+json block that fails to parse is counted as jsonld-invalid and its text is not stored', () => {
+  const result = structures([script('{"@type": "Thing", broken SECRET-INVALID')]);
+  assert.equal(result.jsonLdKept, 0);
+  assert.equal(result.jsonLdOmitted, 0);
+  assert.equal(result.jsonLdInvalid, 1);
+  assert.equal(JSON.stringify(result).includes('SECRET-INVALID'), false);
+  const completeness = completenessFor(result);
+  assert.equal(completeness.complete, false);
+  assert.deepEqual(completeness.reasons, ['jsonld-invalid']);
+  assert.equal(completeness.jsonLdInvalid, 1);
+});
+
+test('valid and invalid ld+json blocks mixed: valid kept, invalid counted separately from the cap', () => {
+  const blocks = [script('{"n":0}'), script('{bad'), script('{"n":1}'), script('[1,2'), ...Array.from({ length: 4 }, (_, index) => script(`{"n":${index + 2}}`))];
+  const result = structures(blocks);
+  assert.deepEqual(result.jsonLd, [{ n: 0 }, { n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }]);
+  assert.equal(result.jsonLdKept, 5);
+  assert.equal(result.jsonLdOmitted, 1);
+  assert.equal(result.jsonLdInvalid, 2);
+  assert.deepEqual(completenessFor(result).reasons, ['jsonld-cap', 'jsonld-invalid']);
+});
+
+test('empty or whitespace-only ld+json blocks carry no data and are not counted', () => {
+  const result = structures([script(''), script('   \n\t '), script('{"ok":true}')]);
+  assert.equal(result.jsonLdKept, 1);
+  assert.equal(result.jsonLdOmitted, 0);
+  assert.equal(result.jsonLdInvalid, 0);
+  assert.equal(completenessFor(result).complete, true);
 });

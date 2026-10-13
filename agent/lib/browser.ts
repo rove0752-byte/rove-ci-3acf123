@@ -340,6 +340,7 @@ export function createBrowserTools(dependencies: {
         timedOut: false,
         jsonLdKept: catalog.jsonLdKept,
         jsonLdOmitted: catalog.jsonLdOmitted,
+        jsonLdInvalid: catalog.jsonLdInvalid,
         rowsKept: catalog.rowsKept,
         rowsOmitted: catalog.rowsOmitted,
         cellsKept: catalog.cellsKept,
@@ -469,18 +470,21 @@ export function collectStructures(root: StructureRoot, bounds: { metaLimit: numb
   }
   const jsonLd: unknown[] = [];
   let jsonLdOmitted = 0;
+  // Blocks that fail to parse are counted separately from the cap; their text is never stored.
+  // An empty or whitespace-only block carries no data, so nothing is lost and it is not counted.
+  let jsonLdInvalid = 0;
   for (const node of [...root.querySelectorAll('script[type="application/ld+json"]')]) {
     const raw = (node.textContent ?? '').trim();
     if (!raw) continue;
     if (raw.length > 20_000) { jsonLdOmitted += 1; continue; }
     let parsed: unknown;
-    try { parsed = JSON.parse(raw); } catch { continue; }
+    try { parsed = JSON.parse(raw); } catch { jsonLdInvalid += 1; continue; }
     if (jsonLd.length >= 5) { jsonLdOmitted += 1; continue; }
     jsonLd.push(parsed);
   }
   return {
     description: description.text, tables, jsonLd, textCapped: description.capped,
-    jsonLdKept: jsonLd.length, jsonLdOmitted, rowsKept, rowsOmitted, cellsKept, cellsOmitted,
+    jsonLdKept: jsonLd.length, jsonLdOmitted, jsonLdInvalid, rowsKept, rowsOmitted, cellsKept, cellsOmitted,
   };
 }
 
