@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   HEADING_LIMIT,
@@ -312,7 +312,40 @@ test('a timeout is recorded on the catalog', () => {
   assert.equal(verifyExtraction(page, 'https://docs.example/start', catalog).pass, false);
 });
 
-test('the saved Python docs page keeps footer links and one copy of each nav heading', () => {
+test('a tracked synthetic docs page keeps footer links and one copy of each nav heading', () => {
+  // Synthetic, tracked fixture (no scraped content) so CI does not depend on ignored pilot output.
+  const html = readFileSync(new URL('./fixtures/nav-dedupe/document.html', import.meta.url), 'utf8');
+  const pageUrl = 'https://docs.example/1.0/';
+  assert.equal((html.match(/<h3>Download<\/h3>/g) ?? []).length, 2, 'fixture repeats the nav heading');
+  const catalog = catalogDocument(html, pageUrl);
+  assert.ok(catalog.links.length > 60, 'links past the old 60 cap are kept');
+  assert.equal(catalog.completeness.linksOmitted, 0);
+  assert.equal(catalog.completeness.headingsOmitted, 0);
+  for (const url of ['https://www.sphinx-doc.org/', 'https://docs.example/license.html', 'https://docs.example/bugs.html', 'https://example.org/donate/']) {
+    assert.equal(catalog.links.some(link => link.url === url), true, url);
+  }
+  assert.ok(catalog.links.filter(link => link.url === 'https://docs.example/1.0/download.html').length >= 2);
+  assert.deepEqual(catalog.headings, [
+    { level: 'h3', text: 'Download' },
+    { level: 'h3', text: 'Docs by version' },
+    { level: 'h3', text: 'Other resources' },
+    { level: 'h3', text: 'Navigation' },
+    { level: 'h1', text: 'Example 1.0 documentation' },
+  ]);
+  const extracted = extractNavigationHeadings(html);
+  assert.deepEqual(extracted.headings, catalog.headings);
+  assert.equal(extracted.headingsOmitted, catalog.completeness.headingsOmitted);
+  const check = verifyExtraction(html, pageUrl, catalog);
+  assert.equal(check.pass, true);
+  assert.equal(check.complete, true);
+  assert.equal(check.countsMatch, true);
+  assert.equal(check.linkIntegrity, true);
+  assert.equal(auditCatalog(html, pageUrl, catalog).pass, true);
+});
+
+// Optional: the saved pilot capture is gitignored; this runs only where that local evidence exists.
+const savedPilot = new URL('../reports/readonly-pilot/structured/document.html', import.meta.url);
+test('the saved Python docs page keeps footer links and one copy of each nav heading', { skip: !existsSync(savedPilot) && 'ignored pilot capture not present' }, () => {
   const html = readFileSync(new URL('../reports/readonly-pilot/structured/document.html', import.meta.url), 'utf8');
   const saved = JSON.parse(readFileSync(new URL('../reports/readonly-pilot/structured/catalog.json', import.meta.url), 'utf8')) as {
     links: { url: string }[];
