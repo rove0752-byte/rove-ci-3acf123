@@ -12,6 +12,13 @@ import { validateUrl } from './policy.ts';
 
 export type TimeoutCause = TimeoutStage | 'snapshot' | 'screenshot';
 
+export class BrowserStopped extends Error {
+  readonly complete = false;
+  readonly failed = true;
+  readonly reason = 'stopped';
+  constructor() { super('Browser operation stopped by the kill switch.'); this.name = 'BrowserStopped'; }
+}
+
 export class ExtractionTimeout extends Error {
   readonly complete = false;
   readonly failed = true;
@@ -146,6 +153,13 @@ export function createBrowserTools(dependencies: {
   const resolve = dependencies.resolve ?? resolvePinned;
   const timeoutMs = dependencies.timeoutMs ?? 30_000;
   const navigationTimeoutMs = dependencies.navigationTimeoutMs ?? 20_000;
+  const active = new Set<{ kill: () => Promise<void> }>();
+  // Stops every visit in progress. Resolves once each browser has closed.
+  async function stop(): Promise<number> {
+    const entries = [...active];
+    await Promise.all(entries.map(entry => entry.kill()));
+    return entries.length;
+  }
   // Same visit deadline the fetch already races. Accessibility calls do not get a second clock.
   type ExtractionBudget = { deadlineAt: number; signal: AbortSignal };
 
@@ -197,6 +211,18 @@ export function createBrowserTools(dependencies: {
         void close().catch(() => {});
       }, timeoutMs);
     });
+    // Kill switch: stop() rejects this visit, aborts in-flight work and closes the browser and its isolation process.
+    let rejectStop: (error: Error) => void = () => {};
+    const stopped = new Promise<never>((_, reject) => { rejectStop = reject; });
+    void stopped.catch(() => {});
+    const entry = { kill: async () => {
+      expired = true;
+      controller.abort();
+      rejectStop(new BrowserStopped());
+      clearTimeout(timer);
+      await close().catch(() => {});
+    } };
+    active.add(entry);
     const work = async () => {
       if (raw.length > 2048) throw new Error('URL exceeds 2048 characters.');
       await validate(raw);
@@ -297,8 +323,8 @@ export function createBrowserTools(dependencies: {
     const job = work();
     // A deadline winner must not leave the fetch rejection unhandled.
     void job.catch(() => {});
-    try { return await Promise.race([job, deadline]); }
-    finally { expired = true; controller.abort(); clearTimeout(timer); await close(); }
+    try { return await Promise.race([job, deadline, stopped]); }
+    finally { active.delete(entry); expired = true; controller.abort(); clearTimeout(timer); await close(); }
   }
 
   async function inspectPage(raw: string) {
@@ -407,7 +433,7 @@ export function createBrowserTools(dependencies: {
         screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), screenshotBytes: screenshot.length };
     });
   }
-  return { inspectPage, navigate, snapshotPage };
+  return { inspectPage, navigate, snapshotPage, stop };
 }
 
 export function omitScreenshot(output: object) {
