@@ -28,6 +28,22 @@ export class ExtractionTimeout extends Error {
   }
 }
 
+// A main-frame navigation after the validated document (meta refresh, form, script) is never followed.
+// The page it leaves behind is not the validated document, so the visit fails instead of returning it.
+export class UnexpectedNavigation extends Error {
+  readonly complete = false;
+  readonly failed = true;
+  readonly reason = 'unexpected-navigation';
+  readonly stage = 'navigation';
+  readonly cause: 'unexpected-navigation' | 'error-page';
+  constructor(cause: 'unexpected-navigation' | 'error-page') {
+    super(cause === 'error-page' ? 'The page ended on a browser error page, not the validated document.'
+      : 'The page started a navigation away from the validated document; it was blocked and not followed.');
+    this.name = 'UnexpectedNavigation';
+    this.cause = cause;
+  }
+}
+
 export type PinnedAddress = { address: string; family: 4 | 6 };
 
 // One checked answer set, in lookup order. Any private or empty answer rejects the whole set.
@@ -196,6 +212,8 @@ export function createBrowserTools(dependencies: {
       let count = 0;
       const hop: { target: string; pinned: readonly PinnedAddress[]; redirect?: string; failure?: Error; served: boolean } =
         { target: '', pinned: [], served: false };
+      // Set when the main frame asks for any document other than the one validated hop. Never cleared.
+      let unexpectedNavigation = false;
       const page = await context.newPage();
       page.on('dialog', dialog => { void dialog.dismiss().catch(() => {}); });
       page.on('download', download => { void download.cancel().catch(() => {}); });
@@ -206,7 +224,10 @@ export function createBrowserTools(dependencies: {
           // Chromium must not open a socket. Only the one main-frame document for this hop is fetched.
           const document = request.method() === 'GET' && request.resourceType() === 'document' &&
             request.isNavigationRequest() && request.frame() === page.mainFrame() && request.url() === hop.target;
-          if (!document || hop.served) { await route.abort(); return; }
+          if (!document || hop.served) {
+            if (request.isNavigationRequest() && request.frame() === page.mainFrame()) unexpectedNavigation = true;
+            await route.abort(); return;
+          }
           hop.served = true;
           const outcome = await fetchDocument(session, new URL(hop.target), hop.pinned, navigationTimeoutMs, controller.signal);
           const status = outcome.status;
@@ -255,7 +276,21 @@ export function createBrowserTools(dependencies: {
         if (!response || response.status() >= 400) throw new Error(`Website returned HTTP ${response?.status() ?? 'unknown'}.`);
         await validate(page.url());
         if (expired || budget.signal.aborted || Date.now() >= budget.deadlineAt) throw new ExtractionTimeout('deadline');
-        return capture(page, response.status(), budget);
+        const landed = () => {
+          if (page.url().startsWith('chrome-error:')) throw new UnexpectedNavigation('error-page');
+          if (unexpectedNavigation || page.url() !== target) throw new UnexpectedNavigation('unexpected-navigation');
+        };
+        landed();
+        let captured: T;
+        try {
+          captured = await capture(page, response.status(), budget);
+        } catch (error) {
+          // A navigation during capture can destroy the document; report it as the navigation it was.
+          if (unexpectedNavigation || page.url() !== target) landed();
+          throw error;
+        }
+        landed();
+        return captured;
       }
       throw new Error('Navigation failed.');
     };

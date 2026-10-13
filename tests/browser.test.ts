@@ -2,8 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { Browser } from 'playwright';
-import { ExtractionTimeout, createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
+import { ExtractionTimeout, UnexpectedNavigation, createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
 import { HEADING_LIMIT, catalogDocument } from '../agent/lib/document-catalog.ts';
+import { validateUrl } from '../agent/lib/policy.ts';
 
 const fixture = `<!doctype html><html><head><title>Safe fixture</title><meta name="description" content="Fixture description"></head><body>
 <h1>Fixture heading</h1>
@@ -592,11 +593,12 @@ function accessibilityTools(options: {
   screenshotFail?: Error;
   screenshotWaitForAbort?: boolean;
   structureRoot?: unknown;
+  pageUrl?: string;
 }) {
   const screenshots: { timeout: number; aborted: boolean; signaled: boolean }[] = [];
   const page = {
     on() {},
-    url: () => 'http://127.0.0.1/a11y',
+    url: () => options.pageUrl ?? 'http://127.0.0.1/a11y',
     async goto() { return { status: () => 200 }; },
     async title() { return 'Deadline fixture'; },
     async content() { return '<title>Deadline fixture</title><h1>Hello</h1>'; },
@@ -689,4 +691,56 @@ test('startup failure and stalled validation settle without leaking', async () =
     launch: async () => { launched = true; throw new Error('unexpected launch'); },
   }).navigate('https://example.com'), /timed out/);
   assert.equal(launched, false);
+});
+
+const isUnexpectedNavigation = (cause?: string) => (error: unknown) => {
+  assert.ok(error instanceof UnexpectedNavigation, String(error));
+  assert.equal(error.complete, false);
+  assert.equal(error.failed, true);
+  assert.equal(error.reason, 'unexpected-navigation');
+  assert.equal(error.stage, 'navigation');
+  if (cause) assert.equal(error.cause, cause);
+  return true;
+};
+
+test('real browser: a meta refresh is never followed and never returned as a complete result', async () => {
+  const requests: string[] = [];
+  const pages: Record<string, string> = {
+    '/refresh-private': '<html><head><title>Refresh</title><meta http-equiv="refresh" content="0;url=http://10.0.0.1/"></head><body><h1>Original</h1></body></html>',
+    '/refresh-same': '<html><head><title>Refresh same</title><meta http-equiv="refresh" content="0;url=/other"></head><body><h1>Original</h1></body></html>',
+    '/plain': '<html><head><title>Plain</title></head><body><h1>Original</h1></body></html>',
+  };
+  const server = createServer((request, response) => {
+    requests.push(request.url ?? '');
+    response.writeHead(200, { 'content-type': 'text/html' });
+    response.end(pages[request.url ?? ''] ?? '<title>Other</title><h1>Other</h1>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  // Only the fixture origin uses the loopback seam. Every other target goes to production validation.
+  const validate = async (raw: string) => new URL(raw).origin === origin ? new URL(raw) : validateUrl(raw);
+  const tools = createBrowserTools({ validate });
+  try {
+    await assert.rejects(tools.inspectPage(`${origin}/refresh-private`), isUnexpectedNavigation());
+    await assert.rejects(tools.inspectPage(`${origin}/refresh-same`), isUnexpectedNavigation());
+    await assert.rejects(tools.navigate(`${origin}/refresh-private`), isUnexpectedNavigation());
+    await assert.rejects(tools.snapshotPage(`${origin}/refresh-same`), isUnexpectedNavigation());
+    // The refresh targets were blocked before any connection: the fixture only served the refreshing documents.
+    assert.deepEqual(requests, ['/refresh-private', '/refresh-same', '/refresh-private', '/refresh-same']);
+    const plain = await tools.inspectPage(`${origin}/plain`);
+    assert.equal(plain.url, `${origin}/plain`);
+    assert.equal(plain.completeness.complete, true);
+    assert.deepEqual(plain.structured.headings, [{ level: 'h1', text: 'Original' }]);
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('a page left on a browser error page or another URL is a structured failure, not a result', async () => {
+  const errorPage = accessibilityTools({ buttons: [], pageUrl: 'chrome-error://chromewebdata/' });
+  await assert.rejects(errorPage.tools.inspectPage('http://127.0.0.1/a11y'), isUnexpectedNavigation('error-page'));
+  assert.equal(errorPage.screenshots.length, 0);
+  const elsewhere = accessibilityTools({ buttons: [], pageUrl: 'http://127.0.0.1/elsewhere' });
+  await assert.rejects(elsewhere.tools.inspectPage('http://127.0.0.1/a11y'), isUnexpectedNavigation('unexpected-navigation'));
+  await assert.rejects(elsewhere.tools.navigate('http://127.0.0.1/a11y'), isUnexpectedNavigation('unexpected-navigation'));
 });
