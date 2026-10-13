@@ -15,7 +15,7 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catc
 const pgidOf = (pid: number) => Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim());
 const killLog = () => existsSync(env.A3_KILL_LOG) ? readFileSync(env.A3_KILL_LOG, 'utf8') : '';
 const register = (name: string, pid: number, pgid: number) => {
-  execFileSync('zsh', ['-c', `source ${join(here, 'registry.sh')}; a3_init; print -r -- "type=pgid pid=${pid} pgid=${pgid} lstart=$(ps -o lstart= -p ${pid});" > "$A3_REGISTRY/${name}"`], { env });
+  execFileSync('zsh', ['-c', `source ${join(here, 'registry.sh')}; a3_init; print -r -- "type=pgid pid=${pid} pgid=${pgid} lstart=$(ps -o lstart= -p ${pid} | sed "s/^ *//;s/ *$//");" > "$A3_REGISTRY/${name}"`], { env });
 };
 const docker = spawnSync('docker', ['image', 'inspect', 'rove-browser-pilot:local']).status === 0;
 
@@ -32,7 +32,7 @@ test('kill.sh stops only a registered target group; supervisor and an unrelated 
   assert.deepEqual(children.filter(alive), [], 'whole target group gone');
   assert.ok(alive(process.pid), 'supervisor (this test) survives');
   assert.ok(alive(sibling.pid!), 'unrelated sibling survives');
-  assert.match(killLog(), /kill name=target1 pgid=\d+ signal=TERM/);
+  assert.match(killLog(), /kill name=target1 pgid=\d+ .*signal=TERM/);
   assert.match(killLog(), /killed name=target1/);
   sibling.kill('SIGKILL');
 });
@@ -50,7 +50,7 @@ test('kill.sh refuses unregistered, own, parent, PID 1 and session-leader target
     assert.equal(r.status, 4, `${name}: ${r.stdout}`);
   }
   assert.match(killLog(), /refuse name=nope reason=not-registered/);
-  assert.match(killLog(), /refuse name=own .*reason=(own-pgid|parent-pgid)/);
+  assert.match(killLog(), /refuse name=own .*reason=ancestor/);
   assert.match(killLog(), /refuse name=pid1 .*reason=pid1/);
   assert.match(killLog(), /refuse name=leader .*reason=session-leader/);
   assert.ok(alive(process.pid) && alive(sibling.pid!) && alive(leader.pid!));
@@ -65,7 +65,7 @@ test('external termination escalates to SIGKILL for a target that ignores SIGTER
   assert.equal(r.status, 0, r.stdout);
   assert.ok(Date.now() - t0 < 5000);
   assert.equal(alive(pid), false);
-  assert.match(killLog(), /kill name=stubborn pgid=\d+ signal=KILL/);
+  assert.match(killLog(), /kill name=stubborn pgid=\d+ .*signal=KILL/);
 });
 
 test('harness evidence is 0700 dirs / 0600 files', { timeout: 120_000 }, () => {
@@ -79,8 +79,11 @@ test('harness evidence is 0700 dirs / 0600 files', { timeout: 120_000 }, () => {
 
 test('container runs use --rm, keep logs, and the wall-clock kill is logged', { skip: !docker && 'local image not present', timeout: 180_000 }, () => {
   const ok = join(root, 'c-ok');
-  const r1 = spawnSync('zsh', [join(here, 'runner.sh'), ok, '120'], { env: { ...env, A3_PAGES: 'simple' }, encoding: 'utf8' });
+  const t0 = Date.now();
+  const r1 = spawnSync('zsh', [join(here, 'runner.sh'), ok, '117'], { env: { ...env, A3_PAGES: 'simple' }, encoding: 'utf8' });
   assert.equal(r1.status, 0, readFileSync(join(ok, 'container.log'), 'utf8'));
+  assert.ok(Date.now() - t0 < 60_000, 'runner returns promptly (no orphan watchdog holding stdout)');
+  assert.equal(spawnSync('pgrep', ['-f', '^sleep 117$']).status, 1, 'no orphan watchdog sleep');
   assert.match(readFileSync(join(ok, 'container.inspect'), 'utf8'), /1000000000 1073741824 256 "none" true true/);
   assert.equal(statSync(ok).mode & 0o777, 0o700);
   const hang = join(root, 'c-hang');
@@ -88,8 +91,8 @@ test('container runs use --rm, keep logs, and the wall-clock kill is logged', { 
   assert.equal(r2.status, 137);
   assert.match(readFileSync(join(hang, 'runner.log'), 'utf8'), /wall-clock kill after 6s/);
   assert.match(killLog(), /wall-clock name=rove-a3-/);
-  const left = spawnSync('docker', ['ps', '-a', '-q', '--filter', 'label=rove.a3=1'], { encoding: 'utf8' }).stdout.trim();
-  assert.equal(left, '', 'no containers left behind');
+  for (const name of killLog().match(/start name=(rove-a3-[0-9-]+)/g)!.map(x => x.slice(11)))
+    assert.equal(spawnSync('docker', ['ps', '-a', '-q', '--filter', `name=^${name}$`], { encoding: 'utf8' }).stdout.trim(), '', `${name} removed`);
   assert.deepEqual(readdirSync(env.A3_REGISTRY).filter(n => n.startsWith('rove-a3-')), [], 'container registry entries cleaned');
 });
 
@@ -105,12 +108,63 @@ test('security: path traversal, malformed entries, foreign containers and PID re
   assert.equal(sh('kill.sh', ['reuse']).status, 4);
   assert.ok(alive(reused.pid!), 'process with recycled pid survives');
   reused.kill('SIGKILL');
-  if (docker) {
-    spawnSync('docker', ['run', '-d', '--rm', '--name', 'a3sec-foreign', '--network', 'none', 'rove-browser-pilot:local', 'sleep', '30']);
-    writeFileSync(join(env.A3_REGISTRY, 'foreign'), 'type=docker container=a3sec-foreign\n');
-    assert.equal(sh('kill.sh', ['foreign']).status, 4);
-    assert.equal(spawnSync('docker', ['ps', '-q', '--filter', 'name=a3sec-foreign'], { encoding: 'utf8' }).stdout.trim().length > 0, true, 'foreign container untouched');
-    spawnSync('docker', ['kill', 'a3sec-foreign']);
-  }
   assert.match(killLog(), /reason=bad-name/); assert.match(killLog(), /reason=malformed-entry/); assert.match(killLog(), /reason=start-time-mismatch/);
+});
+
+// Runs `inner` as the grandchild of a registered group leader G: G -> zsh (own group) -> kill.sh.
+test('H1: kill.sh refuses a grandparent (any ancestor) group and the caller survives', () => {
+  const reg = join(here, 'registry.sh');
+  const script = `source ${reg}; a3_init; print -r -- "type=pgid pid=$$ pgid=$$ lstart=$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//');" > "$A3_REGISTRY/gp"; perl -e 'setpgrp(0,0); exec @ARGV' zsh -c 'perl -e "setpgrp(0,0); exec @ARGV" zsh ${join(here, 'kill.sh')} gp; echo inner=$?'; echo outer-alive`;
+  const r = spawnSync('perl', ['-e', 'setpgrp(0,0); exec @ARGV', 'zsh', '-c', script], { env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /inner=4/);
+  assert.match(r.stdout, /outer-alive/);
+  assert.match(killLog(), /refuse name=gp .*reason=ancestor/);
+});
+
+test('H1: own-pgid-only case (kill.sh exec-ed inside the registered group) is refused', () => {
+  const reg = join(here, 'registry.sh');
+  const script = `source ${reg}; a3_init; print -r -- "type=pgid pid=$$ pgid=$$ lstart=$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//');" > "$A3_REGISTRY/self"; zsh ${join(here, 'kill.sh')} self; echo rc=$?`;
+  const r = spawnSync('perl', ['-e', 'setpgrp(0,0); exec @ARGV', 'zsh', '-c', script], { env, encoding: 'utf8' });
+  assert.match(r.stdout, /rc=4/);
+  assert.match(killLog(), /refuse name=self .*reason=ancestor/);
+});
+
+test('M3: when the leader has exited, verified orphan members are still killed', async () => {
+  const pid = Number(sh('spawn.sh', ['orph', join(root, 'o.log'), '--', 'zsh', '-c', 'perl -e \'$SIG{TERM}="IGNORE"; sleep 60\' & echo $! > ' + join(root, 'orph.child') + '; sleep 0.3']).stdout.trim());
+  await new Promise(res => setTimeout(res, 1500));
+  const child = Number(readFileSync(join(root, 'orph.child'), 'utf8'));
+  assert.equal(alive(pid), false, 'leader exited');
+  assert.ok(alive(child), 'orphan member alive');
+  const r = sh('kill.sh', ['orph']);
+  assert.equal(r.status, 0, r.stdout);
+  assert.equal(alive(child), false, 'orphan member killed');
+  assert.match(killLog(), /kill name=orph .*leader=exited signal=TERM/);
+  assert.match(killLog(), /kill name=orph .*signal=KILL/);
+});
+
+test('M3/M5: a group member that predates the recorded leader start is not signalled (unverifiable)', () => {
+  const m = spawn('perl', ['-e', 'setpgrp(0,0); sleep 60'], { stdio: 'ignore' });
+  spawnSync('sleep', ['1.2']);
+  // Forged entry: leader pid is m (still alive) but recorded start is later than m's real start.
+  const later = new Date(Date.now() + 120_000).toString().replace(/ GMT.*/, '').replace(/^(\w+) (\w+) (\d+) (\d+) ([\d:]+)/, '$1 $2 $3 $5 $4');
+  writeFileSync(join(env.A3_REGISTRY, 'early'), `type=pgid pid=${m.pid} pgid=${m.pid} lstart=${later};\n`);
+  assert.equal(sh('kill.sh', ['early']).status, 4);
+  assert.ok(alive(m.pid!));
+  m.kill('SIGKILL');
+});
+
+test('M6: a look-alike container (matching name, rove.a3=1 label, real id) with the wrong nonce is refused; the right nonce works', { skip: !docker && 'local image not present', timeout: 60_000 }, () => {
+  const name = `rove-a3-1-${process.pid}`;
+  spawnSync('docker', ['run', '-d', '--rm', '--pull', 'never', '--network', 'none', '--label', 'rove.a3=1', '--label', 'rove.a3.nonce=' + 'a'.repeat(32), '--name', name, 'rove-browser-pilot:local', 'sleep', '60']);
+  const [id, created] = spawnSync('docker', ['inspect', '-f', '{{.Id}} {{.Created}}', name], { encoding: 'utf8' }).stdout.trim().split(' ');
+  writeFileSync(join(env.A3_REGISTRY, 'spoof'), `type=docker name=${name} id=${id} created=${created} nonce=${'b'.repeat(32)}\n`);
+  assert.equal(sh('kill.sh', ['spoof']).status, 4);
+  assert.match(killLog(), /refuse name=spoof .*reason=container-not-ours/);
+  assert.equal(spawnSync('docker', ['ps', '-q', '--filter', `name=^${name}$`], { encoding: 'utf8' }).stdout.trim().length > 0, true, 'look-alike untouched');
+  writeFileSync(join(env.A3_REGISTRY, 'mine'), `type=docker name=${name} id=${id} created=${created} nonce=${'a'.repeat(32)}\n`);
+  assert.equal(sh('kill.sh', ['mine']).status, 0);
+  assert.equal(spawnSync('docker', ['ps', '-aq', '--filter', `name=^${name}$`], { encoding: 'utf8' }).stdout.trim(), '');
+  writeFileSync(join(env.A3_REGISTRY, 'legacy'), `type=docker container=${name}\n`);
+  assert.equal(sh('kill.sh', ['legacy']).status, 4, 'name-only entries are malformed');
 });

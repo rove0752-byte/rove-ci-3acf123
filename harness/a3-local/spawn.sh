@@ -9,6 +9,6 @@ perl -e 'setpgrp(0,0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' "$@" >
 PID=$!
 sleep 0.2
 PG=$(ps -o pgid= -p $PID | tr -d ' ')
-print -r -- "type=pgid pid=$PID pgid=$PG lstart=$(ps -o lstart= -p $PID);" > "$A3_REGISTRY/$NAME"
+print -r -- "type=pgid pid=$PID pgid=$PG lstart=$(ps -o lstart= -p $PID | sed "s/^ *//;s/ *$//");" > "$A3_REGISTRY/$NAME"
 a3_log "spawn name=$NAME pid=$PID pgid=$PG"
 print $PID
