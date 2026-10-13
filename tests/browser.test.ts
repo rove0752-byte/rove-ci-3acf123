@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { Browser } from 'playwright';
-import { ExtractionTimeout, UnexpectedNavigation, createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
+import { ExtractionTimeout, accessibilityDeadline, UnexpectedNavigation, createBrowserTools, launchBrowser, omitScreenshot, resolvePinned, selectPinnedAddresses } from '../agent/lib/browser.ts';
 import { HEADING_LIMIT, catalogDocument } from '../agent/lib/document-catalog.ts';
 import { validateUrl } from '../agent/lib/policy.ts';
 
@@ -454,7 +454,7 @@ test('an ariaSnapshot timeout is a structured deadline failure', async () => {
   assert.equal(screenshots, 0);
 });
 
-test('accessibility inspection does not start another snapshot after the deadline', async () => {
+test('accessibility inventory stops at its own budget with a flagged partial result and no further calls', async () => {
   let snapshots = 0;
   let visibleChecks = 0;
   let disabledChecks = 0;
@@ -462,7 +462,7 @@ test('accessibility inspection does not start another snapshot after the deadlin
   const onUnhandled = (error: unknown) => { unhandled.push(error); };
   process.on('unhandledRejection', onUnhandled);
   try {
-    const { tools } = accessibilityTools({
+    const { tools, screenshots } = accessibilityTools({
       timeoutMs: 800,
       buttons: [
         { visible: true, disabled: false, label: 'First', waitForAbort: true },
@@ -472,16 +472,14 @@ test('accessibility inspection does not start another snapshot after the deadlin
       onVisible() { visibleChecks += 1; },
       onDisabled() { disabledChecks += 1; },
     });
-    await assert.rejects(tools.inspectPage('http://127.0.0.1/a11y'), (error: unknown) => {
-      assert.ok(error instanceof ExtractionTimeout);
-      assert.equal(error.stage, 'deadline');
-      assert.equal(error.cause, 'deadline');
-      assert.equal(error.complete, false);
-      assert.equal(error.failed, true);
-      assert.equal(error.timedOut, true);
-      assert.match(error.message, /timed out/);
-      return true;
-    });
+    const started = Date.now();
+    const result = await tools.snapshotPage('http://127.0.0.1/a11y');
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 800, `finished inside the visit deadline (${elapsed}ms)`);
+    assert.deepEqual(result.accessibilityCompleteness, { complete: false, kept: 0, omitted: 0, reasons: ['deadline'], stopped: 'deadline', partial: true });
+    assert.equal(result.truncated, true);
+    assert.equal(screenshots.length, 1, 'the screenshot still ran in its reserve');
+    assert.equal(screenshots[0]?.aborted, false);
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.equal(snapshots, 1);
     assert.equal(visibleChecks, 1);
@@ -492,49 +490,60 @@ test('accessibility inspection does not start another snapshot after the deadlin
   }
 });
 
-test('a screenshot timeout is one structured failure', async () => {
+test('accessibility deadline arithmetic stays inside the visit and never goes negative in effect', () => {
+  // 30s visit: 10s budget wins.
+  assert.equal(accessibilityDeadline(1_000, 31_000, 30_000), 11_000);
+  // Late start: the visit deadline minus the 5s screenshot reserve wins.
+  assert.equal(accessibilityDeadline(25_000, 31_000, 30_000), 26_000);
+  // Already past the reserve: the deadline is in the past, so no inventory call may start.
+  assert.ok(accessibilityDeadline(30_000, 31_000, 30_000) <= 30_000);
+  // Short visits scale the reserve to a quarter of the visit.
+  assert.equal(accessibilityDeadline(0, 800, 800), 600);
+  assert.equal(accessibilityDeadline(0, 100_000, 100_000, -5), 0);
+});
+
+test('an inventory call that ignores the abort signal is still bounded by the budget', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown) => { unhandled.push(error); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const { tools } = accessibilityTools({ buttons: [{ visible: true, disabled: false, label: 'Go' }], hangCount: true });
+    const started = Date.now();
+    const result = await createBoundedSnapshot(tools);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 1_500, `bounded (${elapsed}ms)`);
+    assert.equal(result.accessibilityCompleteness.stopped, 'deadline');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(unhandled.length, 0);
+  } finally { process.off('unhandledRejection', onUnhandled); }
+});
+test('a screenshot cap timeout keeps the extracted result and flags the missing image', async () => {
   const { tools, screenshots } = accessibilityTools({
     buttons: [{ visible: true, disabled: false, label: 'Go' }],
     screenshotFail: new Error('Timeout 5000ms exceeded.'),
   });
-  await assert.rejects(tools.inspectPage('http://127.0.0.1/a11y'), (error: unknown) => {
-    assert.ok(error instanceof ExtractionTimeout);
-    assert.equal(error.cause, 'screenshot');
-    assert.equal(error.stage, 'deadline');
-    assert.equal(error.complete, false);
-    assert.equal(error.failed, true);
-    assert.equal(error.reason, 'timeout');
-    assert.equal(error.timedOut, true);
-    assert.match(error.message, /timed out/);
-    return true;
-  });
+  const result = await tools.inspectPage('http://127.0.0.1/a11y');
+  assert.equal(result.screenshotTimedOut, true);
+  assert.equal(result.screenshotBase64, null);
+  assert.equal(result.screenshotSha256, null);
+  assert.ok(result.text.includes('Hello'));
   assert.equal(screenshots.length, 1);
   assert.equal(screenshots[0]?.timeout, 5000);
-  assert.equal(screenshots[0]?.aborted, false);
   assert.equal(screenshots[0]?.signaled, true);
 });
-
-test('a snapshot screenshot timeout is one structured failure', async () => {
+test('a snapshot screenshot cap timeout keeps the inventory', async () => {
   const { tools, screenshots } = accessibilityTools({
-    buttons: [],
+    buttons: [{ visible: true, disabled: false, label: 'Go' }],
     screenshotFail: new Error('Timeout 5000ms exceeded.'),
   });
-  await assert.rejects(tools.snapshotPage('http://127.0.0.1/a11y'), (error: unknown) => {
-    assert.ok(error instanceof ExtractionTimeout);
-    assert.equal(error.cause, 'screenshot');
-    assert.equal(error.stage, 'deadline');
-    assert.equal(error.complete, false);
-    assert.equal(error.failed, true);
-    assert.equal(error.reason, 'timeout');
-    assert.equal(error.timedOut, true);
-    assert.match(error.message, /timed out/);
-    return true;
-  });
+  const result = await tools.snapshotPage('http://127.0.0.1/a11y');
+  assert.equal(result.screenshotTimedOut, true);
+  assert.equal(result.screenshotBase64, null);
+  assert.equal(result.screenshotBytes, 0);
+  assert.equal(result.elements.length, 1);
   assert.equal(screenshots.length, 1);
   assert.ok(screenshots[0] && screenshots[0].timeout >= 1 && screenshots[0].timeout <= 5000);
-  assert.equal(screenshots[0]?.signaled, true);
 });
-
 test('a screenshot that outlives the visit deadline stays a deadline failure', async () => {
   const unhandled: unknown[] = [];
   const onUnhandled = (error: unknown) => { unhandled.push(error); };
@@ -597,6 +606,8 @@ function accessibilityTools(options: {
   screenshotWaitForAbort?: boolean;
   structureRoot?: unknown;
   pageUrl?: string;
+  hangCount?: boolean;
+  accessibilityBudgetMs?: number;
 }) {
   const screenshots: { timeout: number; aborted: boolean; signaled: boolean }[] = [];
   const page = {
@@ -635,7 +646,7 @@ function accessibilityTools(options: {
     getByRole(role: string) {
       const buttons = role === 'button' ? options.buttons : [];
       return {
-        async count() { return buttons.length; },
+        async count() { if (options.hangCount && role === 'link') await new Promise(() => {}); return buttons.length; },
         nth(index: number) {
           const button = buttons[index];
           return {
@@ -677,6 +688,7 @@ function accessibilityTools(options: {
   };
   const tools = createBrowserTools({
     timeoutMs: options.timeoutMs ?? 30_000,
+    accessibilityBudgetMs: options.accessibilityBudgetMs ?? (options.hangCount ? 300 : undefined),
     launch: async () => browser as never,
     validate: async raw => new URL(raw),
     resolve: async () => [{ address: '127.0.0.1', family: 4 as const }],
@@ -747,3 +759,7 @@ test('a page left on a browser error page or another URL is a structured failure
   await assert.rejects(elsewhere.tools.inspectPage('http://127.0.0.1/a11y'), isUnexpectedNavigation('unexpected-navigation'));
   await assert.rejects(elsewhere.tools.navigate('http://127.0.0.1/a11y'), isUnexpectedNavigation('unexpected-navigation'));
 });
+
+function createBoundedSnapshot(tools: ReturnType<typeof createBrowserTools>) {
+  return tools.snapshotPage('http://127.0.0.1/a11y');
+}

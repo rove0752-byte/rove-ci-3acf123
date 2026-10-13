@@ -12,6 +12,14 @@ import { validateUrl } from './policy.ts';
 
 export type TimeoutCause = TimeoutStage | 'snapshot' | 'screenshot';
 
+// Whole-inventory budget. It ends early enough to leave the screenshot its reserve inside the visit deadline.
+export const ACCESSIBILITY_BUDGET_MS = 10_000;
+export const SCREENSHOT_RESERVE_MS = 5_000;
+export function accessibilityDeadline(now: number, visitDeadlineAt: number, visitTimeoutMs: number, budgetMs = ACCESSIBILITY_BUDGET_MS): number {
+  const reserve = Math.min(SCREENSHOT_RESERVE_MS, Math.floor(visitTimeoutMs / 4));
+  return Math.min(now + Math.max(0, budgetMs), visitDeadlineAt - reserve);
+}
+
 export class ExtractionTimeout extends Error {
   readonly complete = false;
   readonly failed = true;
@@ -140,12 +148,14 @@ export function createBrowserTools(dependencies: {
   resolve?: (url: URL) => Promise<readonly PinnedAddress[]>;
   timeoutMs?: number;
   navigationTimeoutMs?: number;
+  accessibilityBudgetMs?: number;
 } = {}) {
   const launch = dependencies.launch ?? launchBrowser;
   const validate = dependencies.validate ?? validateUrl;
   const resolve = dependencies.resolve ?? resolvePinned;
   const timeoutMs = dependencies.timeoutMs ?? 30_000;
   const navigationTimeoutMs = dependencies.navigationTimeoutMs ?? 20_000;
+  const accessibilityBudgetMs = dependencies.accessibilityBudgetMs ?? ACCESSIBILITY_BUDGET_MS;
   // Same visit deadline the fetch already races. Accessibility calls do not get a second clock.
   type ExtractionBudget = { deadlineAt: number; signal: AbortSignal };
 
@@ -166,10 +176,42 @@ export function createBrowserTools(dependencies: {
 
   async function withinDeadline<T>(budget: ExtractionBudget, run: () => Promise<T>, cause?: 'snapshot' | 'screenshot'): Promise<T> {
     if (budget.signal.aborted || budget.deadlineAt - Date.now() < 1) throw new ExtractionTimeout('deadline', 'deadline');
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(new ExtractionTimeout('deadline', 'deadline'));
+      budget.signal.addEventListener('abort', onAbort, { once: true });
+    });
+    const call = run();
+    // The losing call must not surface as an unhandled rejection.
+    void call.catch(() => {});
     try {
-      return await run();
+      return await Promise.race([call, aborted]);
     } catch (error) {
       throw deadlineFailure(error, budget, cause);
+    } finally {
+      if (onAbort) budget.signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  // A child budget for the accessibility inventory: aborts at its own deadline or with the visit.
+  function childBudget(parent: ExtractionBudget, deadlineAt: number) {
+    const controller = new AbortController();
+    const forward = () => controller.abort();
+    if (parent.signal.aborted) controller.abort(); else parent.signal.addEventListener('abort', forward, { once: true });
+    const timer = setTimeout(() => controller.abort(), Math.max(0, deadlineAt - Date.now()));
+    return {
+      budget: { deadlineAt, signal: controller.signal } as ExtractionBudget,
+      ownExpiry: () => !parent.signal.aborted && Date.now() < parent.deadlineAt,
+      dispose: () => { clearTimeout(timer); parent.signal.removeEventListener('abort', forward); },
+    };
+  }
+
+  // A screenshot that hits its own cap leaves the extracted result intact. The visit deadline still fails the visit.
+  async function optionalScreenshot(page: Page, budget: ExtractionBudget): Promise<Buffer | null> {
+    try { return await captureScreenshot(page, budget); }
+    catch (error) {
+      if (error instanceof ExtractionTimeout && error.cause === 'screenshot' && !budget.signal.aborted && Date.now() < budget.deadlineAt) return null;
+      throw error;
     }
   }
 
@@ -346,23 +388,25 @@ export function createBrowserTools(dependencies: {
         cellsKept: catalog.cellsKept,
         cellsOmitted: catalog.cellsOmitted,
       });
-      const screenshot = await captureScreenshot(page, budget);
+      const screenshot = await optionalScreenshot(page, budget);
       const title = await page.title();
       return { evidenceId: randomUUID(), url: page.url(), title, httpStatus: status,
         capturedAt: new Date().toISOString(), text: content.slice(0, 18_000), truncated: content.length > 18_000,
         links, completeness, accessibilityCompleteness: listed.accessibilityCompleteness,
         structured: { title, description: catalog.description, headings: headed.headings, links, tables: catalog.tables, jsonLd: catalog.jsonLd, completeness },
-        screenshotBase64: screenshot.toString('base64'),
-        screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), durationMs: Date.now() - started,
+        screenshotBase64: screenshot ? screenshot.toString('base64') : null,
+        screenshotSha256: screenshot ? createHash('sha256').update(screenshot).digest('hex') : null, screenshotTimedOut: screenshot === null, durationMs: Date.now() - started,
         mode: 'read_only_no_javascript' as const };
     });
   }
 
   const inventoryLimit = 60;
 
-  function accessibilityCompleteness(kept: number, omitted: number) {
-    const reasons = omitted > 0 ? ['inventory-cap' as const] : [];
-    return { complete: reasons.length === 0, kept, omitted, reasons };
+  function accessibilityCompleteness(kept: number, omitted: number, stopped: 'deadline' | null = null) {
+    const reasons: ('inventory-cap' | 'deadline')[] = omitted > 0 ? ['inventory-cap'] : [];
+    if (stopped) reasons.push('deadline');
+    // `stopped` appears only on a partial inventory, so complete results keep their existing shape.
+    return { complete: reasons.length === 0, kept, omitted, reasons, ...(stopped ? { stopped, partial: true as const } : {}) };
   }
 
   async function inventory(page: Page, status: number, budget: ExtractionBudget) {
@@ -370,6 +414,11 @@ export function createBrowserTools(dependencies: {
       'option', 'slider', 'spinbutton', 'switch', 'tab', 'menuitem', 'searchbox'] as const;
     const elements: { role: string; accessibility: string; disabled: boolean }[] = [];
     let omitted = 0;
+    let stopped: 'deadline' | null = null;
+    const visitBudget = budget;
+    const child = childBudget(visitBudget, accessibilityDeadline(Date.now(), visitBudget.deadlineAt, timeoutMs, accessibilityBudgetMs));
+    budget = child.budget;
+    try {
     for (const role of roles) {
       const matches = page.getByRole(role);
       const count = await withinDeadline(budget, () => matches.count());
@@ -388,10 +437,16 @@ export function createBrowserTools(dependencies: {
         elements.push({ role, accessibility: accessibility.slice(0, 1000), disabled });
       }
     }
-    const truncated = omitted > 0;
+    } catch (error) {
+      // Only the inventory's own budget yields a partial result; a visit deadline or per-call cap still fails.
+      if (!(error instanceof ExtractionTimeout && error.cause === 'deadline' && child.ownExpiry())) throw error;
+      stopped = 'deadline';
+    } finally { child.dispose(); }
+    budget = visitBudget;
+    const truncated = omitted > 0 || stopped !== null;
     return { evidenceId: randomUUID(), url: page.url(), title: await withinDeadline(budget, () => page.title()), httpStatus: status,
       capturedAt: new Date().toISOString(), elements, truncated,
-      accessibilityCompleteness: accessibilityCompleteness(elements.length, omitted),
+      accessibilityCompleteness: accessibilityCompleteness(elements.length, omitted, stopped),
       mode: 'read_only_no_javascript' as const };
   }
 
@@ -402,9 +457,10 @@ export function createBrowserTools(dependencies: {
   function snapshotPage(raw: string) {
     return visit(raw, async (page, status, budget) => {
       const details = await inventory(page, status, budget);
-      const screenshot = await captureScreenshot(page, budget);
-      return { ...details, screenshotBase64: screenshot.toString('base64'),
-        screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), screenshotBytes: screenshot.length };
+      const screenshot = await optionalScreenshot(page, budget);
+      return { ...details, screenshotBase64: screenshot ? screenshot.toString('base64') : null,
+        screenshotSha256: screenshot ? createHash('sha256').update(screenshot).digest('hex') : null,
+        screenshotBytes: screenshot ? screenshot.length : 0, screenshotTimedOut: screenshot === null };
     });
   }
   return { inspectPage, navigate, snapshotPage };
