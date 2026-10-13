@@ -172,6 +172,13 @@ function parseFetch(value: unknown): FetchCommand | undefined {
   };
 }
 
+// Returns a failure message when the connected peer is not the pinned literal. Exported for tests.
+export function peerFailure(remote: string | undefined, pinned: string): string | null {
+  if (!remote) return 'Connected peer address is unavailable.';
+  const strip = (value: string) => value.toLowerCase().replace(/^\[|\]$/g, '').replace(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/, '$1');
+  return strip(remote) === strip(pinned) ? null : 'Connected peer does not match the pinned address.';
+}
+
 // The pinned literal is the socket destination. This callback never calls the system resolver.
 function fetchPinned(command: FetchCommand, onDial: () => void): { done: Promise<IsolatedDocument>; destroy: () => void } {
   let requestDestroy = () => {};
@@ -238,8 +245,14 @@ function fetchPinned(command: FetchCommand, onDial: () => void): { done: Promise
         dialed = true;
         onDial();
       };
-      if (socket.connecting) socket.once('connect', announce);
-      else announce();
+      // Post-connect check: the connected peer must be the pinned literal (the literal was checked public before pinning).
+      const verify = () => {
+        const failure = peerFailure(socket.remoteAddress, command.address);
+        if (failure) { request.destroy(); finish(new Error(failure)); return; }
+        announce();
+      };
+      if (socket.connecting) socket.once('connect', verify);
+      else verify();
     });
     request.on('error', () => finish(new Error('Navigation failed.')));
     request.end();
