@@ -81,3 +81,4 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
 - Residual risks (same-user trust):
   - run.sh and registry.sh/kill.sh still run from the live tree. The PATH lookups for python3, git, docker and shasum are trusted.
   - node_modules isn't integrity-checked; only its lockfile hash is recorded.
+- Private git homes are named `rove-a3-ghome-<pid>-<lstart>.*` and, like snapshots, are swept at the next start after a SIGKILL.

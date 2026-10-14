@@ -437,7 +437,8 @@ test('R3-6: a SIGKILLed supervisor leaves resources that the next start sweeps',
   assert.notEqual(q('ps') + q('volume'), '', 'SIGKILL leaves something behind (precondition)');
   const r = run('after-kill', 30, ['http://allowed.test/a']);
   assert.match(r.read('supervisor.log') + readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale/);
-  assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale snapshot/, 'R5-4: killed run snapshot swept');
+  assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale snapshot .*rove-a3-snap-/, 'R5-4: killed run snapshot swept');
+  assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale snapshot .*rove-a3-ghome-/, 'R6-1: killed run private git home swept');
   assert.equal(q('ps'), ''); assert.equal(q('volume'), '');
 });
 test('R3-7: policy.json + policy.sha256 edited together (uncommitted) are refused outside test mode', { timeout: 60_000 }, () => {

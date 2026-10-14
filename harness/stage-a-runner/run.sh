@@ -12,7 +12,8 @@ SELF=${0:A:h}; WT=${SELF:h:h}; source $WT/harness/a3-local/registry.sh; a3_init
 # empty HOME, and hooks / attributesFile / fsmonitor disabled. Repo-local config (filters in .git/config,
 # .git/info/attributes) cannot be fully disabled from the command line, so the snapshot is ALSO verified blob-by-blob.
 unset -m 'GIT_*'; unset -m 'PYTHON*'; export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
-GHOME=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-ghome.XXXXXX") || exit 5
+SUP="$$-$(a3_lstart $$ | tr -cd '0-9A-Za-z')"
+GHOME=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-ghome-$SUP.XXXXXX") || exit 5
 trap 'rm -rf "$GHOME"' EXIT
 git() { HOME=$GHOME XDG_CONFIG_HOME=$GHOME command git -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false "$@"; }
 OUT=$1; WALL=$2; shift 2; URLS="$*"
@@ -57,7 +58,6 @@ umask 077; mkdir -p -m 700 "$OUT" "$OUT/proxy" "$OUT/browser"; chmod 700 "$OUT" 
 # into a private read-only snapshot after the checks; test mode copies the tracked + untracked (non-ignored) working
 # files (so uncommitted test edits still run) unless STAGE_A_TEST_SNAPSHOT=git-archive. node_modules stays a live
 # read-only mount (outside git); its .package-lock.json sha256 is recorded.
-SUP="$$-$(a3_lstart $$ | tr -cd '0-9A-Za-z')"
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-snap-$SUP.XXXXXX") || { echo "STOP: snapshot dir"; exit 5; }
 if [ "$TEST" != 1 ] || [ "${STAGE_A_TEST_SNAPSHOT:-}" = git-archive ]; then
   git -C "$WT" archive --format=tar HEAD | tar -x -C "$SNAP" && SNAPKIND="git-archive:$HEAD_COMMIT"
@@ -84,8 +84,8 @@ ID=$(date +%Y%m%d%H%M%S)-$$; F=rove-a3-${ID}1; P=rove-a3-${ID}2; B=rove-a3-${ID}
 START=$(date +%s)
 a3_protect $$
 # Snapshot sweep (R5-4): remove our own stale snapshot dirs (rove-a3-snap-<pid>-<lstart>.*) whose supervisor is dead.
-for sd in ${TMPDIR:-/tmp}/rove-a3-snap-*(N/); do
-  ssup=${${sd:t}#rove-a3-snap-}; ssup=${ssup%.*}
+for sd in ${TMPDIR:-/tmp}/rove-a3-snap-*(N/) ${TMPDIR:-/tmp}/rove-a3-ghome-*(N/); do   # snapshots + private git homes
+  ssup=${${sd:t}#rove-a3-(snap|ghome)-}; ssup=${ssup%.*}
   [[ $ssup =~ '^[0-9]+-[0-9A-Za-z]+$' ]] && [ -O "$sd" ] && [ ! -L "$sd" ] || continue
   [ "$(a3_lstart ${ssup%%-*} | tr -cd '0-9A-Za-z')" = "${ssup#*-}" ] && continue
   chmod -R u+w "$sd" && rm -rf "$sd" && a3_log "stage-a sweep stale snapshot $sd"
