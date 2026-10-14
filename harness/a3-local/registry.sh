@@ -12,3 +12,12 @@ a3_register_container() { # <registry-name> <container-name> <nonce>
   [ -n "$info" ] || return 1
   print -r -- "type=docker name=$2 id=${info%% *} created=${info#* } nonce=$3" > "$A3_REGISTRY/$1"
 }
+# Protected supervisors (review t26 N2): pid + lstart. kill.sh refuses any target whose pid/pgid or group members
+# include a live protected process, regardless of ancestry (covers double-fork+setsid, nohup, disown, cron/launchd callers).
+: ${A3_PROTECTED:=$HOME/.rove-a3/protected}
+a3_lstart() { ps -o lstart= -p $1 2>/dev/null | sed 's/^ *//;s/ *$//'; }
+a3_protect() { # <pid>   (removed again by a3_unprotect; stale entries are ignored because lstart must match)
+  umask 077; mkdir -p -m 700 "$A3_PROTECTED"
+  print -r -- "pid=$1 lstart=$(a3_lstart $1);" > "$A3_PROTECTED/$1"
+}
+a3_unprotect() { rm -f "$A3_PROTECTED/$1"; }
