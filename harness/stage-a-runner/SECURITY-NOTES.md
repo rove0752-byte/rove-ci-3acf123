@@ -66,3 +66,18 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
   - Runs default to test mode (results carry `-TEST`).
   - Production is tested on its refusal paths.
   - The approval logic is tested by calling check-approval.py directly.
+
+## Round 6 changes (builder claims, pending a new independent review per D-29)
+- R6-1 git environment: run.sh unsets every GIT_* and PYTHON* variable and sets GIT_CONFIG_NOSYSTEM=1, GIT_CONFIG_GLOBAL=/dev/null, and HOME/XDG_CONFIG_HOME to a private temp dir. Every git call adds `-c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false`.
+- R6-1 index flags: production refuses if any `git ls-files -v` entry isn't `H`, which catches skip-worktree, assume-unchanged and similar.
+- R6-1 snapshot verification: `verify-snapshot.py` recomputes every blob id in Python and compares it with `git ls-tree -r HEAD`, including modes, symlinks, missing files and extra files. A mismatch refuses the run with exit 8.
+  - This is the control against repo-local filters, export-subst and export-ignore (from .git/config or .git/info/attributes), which command-line flags can't fully disable.
+  - The snapshot's policy hash is then re-checked against both the pin committed in HEAD and the live pin.
+- R6-1 trusted helpers: in production, check-approval.py and verify-snapshot.py come from `git cat-file blob HEAD:…` into the private temp dir, never from the live tree.
+- New summary.json fields: snapshot_verified (e.g. "ok 170") and snapshot_policy_sha256.
+- R6-2 end-to-end production test: a throwaway clone, a fake passwd home in a temp dir, and a python3 shim on PATH that changes only pwd.getpwuid. Everything else is the unchanged production code path, with local fixtures and --network none.
+  - Why it can't enable real production: the shim and fake home exist only inside the test's temp dir and process tree. The real APPROVED-COMMITS.txt is asserted unchanged and empty. Planting a python3 earlier on PATH already requires same-user code execution.
+  - The pin re-check can't be triggered on its own, because any change to the snapshot's policy is caught first by blob verification (tested with a policy.json smudge filter). The test asserts snapshot_policy_sha256 equals the pin.
+- Residual risks (same-user trust):
+  - run.sh and registry.sh/kill.sh still run from the live tree. The PATH lookups for python3, git, docker and shasum are trusted.
+  - node_modules isn't integrity-checked; only its lockfile hash is recorded.

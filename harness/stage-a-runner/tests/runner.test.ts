@@ -586,3 +586,84 @@ test('R4-4: copy-out is aborted and the run fails if the browser container is st
   assert.equal(r.summary.scratch_copied, 0); assert.equal(existsSync(join(r.out, 'browser/late.txt')), false);
   assert.match(r.read('supervisor.log'), /copy-out aborted/); nothingLeft(r);
 });
+
+// ---- Round 6 ----
+// R6-2 harness: an isolated production run. Production deliberately ignores every allowlist override (R5-2), so the test
+// gives run.sh a fake *passwd* home: a python3 shim, first on PATH and only inside this test's temp dir, loads a
+// sitecustomize that makes pwd.getpwuid() return that fake home. Everything else is the unmodified production path
+// (no STAGE_A_TEST, no hooks) on a throwaway clone with local fixtures only (all containers --network none).
+// It cannot enable real production: the real APPROVED-COMMITS.txt is never read or written (asserted unchanged and
+// empty), the shim exists only in a temp dir for this process tree, and planting a python3 earlier on PATH already
+// requires same-user code execution (documented trust boundary).
+const realAllow = join(spawnSync('python3', ['-c', 'import pwd,os;print(pwd.getpwuid(os.getuid()).pw_dir)'], { encoding: 'utf8' }).stdout.trim(), 'rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt');
+const fileSha = (f: string) => existsSync(f) ? spawnSync('shasum', ['-a', '256', f], { encoding: 'utf8' }).stdout.split(' ')[0] : 'absent';
+const prodHarness = () => {
+  const { d, g, head } = scratchClone();
+  const nmLive = join(dirname(dirname(here)), 'node_modules');
+  spawnSync('ln', ['-s', spawnSync('readlink', [nmLive], { encoding: 'utf8' }).stdout.trim() || nmLive, join(d, 'node_modules')]);
+  const h = mkdtempSync(join(tmpdir(), 'r62-')), fake = join(h, 'home'), shim = join(h, 'shim');
+  mkdirSync(join(fake, 'rove-recovery-evidence/stage-a-runner'), { recursive: true }); mkdirSync(shim);
+  writeFileSync(join(fake, 'rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt'), `${head()} r62-test-only\n`, { mode: 0o600 });
+  const realPy = spawnSync('python3', ['-c', 'import sys;print(sys.executable)'], { encoding: 'utf8' }).stdout.trim();
+  writeFileSync(join(shim, 'sitecustomize.py'), `import os, pwd\n_r = pwd.getpwuid\ndef getpwuid(uid):\n    p = _r(uid)\n    return pwd.struct_passwd((p.pw_name, p.pw_passwd, p.pw_uid, p.pw_gid, p.pw_gecos, ${JSON.stringify(fake)}, p.pw_shell)) if uid == os.getuid() else p\npwd.getpwuid = getpwuid\n`);
+  writeFileSync(join(shim, 'python3'), `#!/bin/sh\nPYTHONPATH=${JSON.stringify(shim)} exec ${JSON.stringify(realPy)} "$@"\n`, { mode: 0o700 });
+  const go = (extra: Record<string, string> = {}, urls = ['http://allowed.test/a']) => {
+    const out = join(mkdtempSync(join(root, 'r62run-')), 'ev');
+    const r = spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), out, '40', ...urls], { env: { ...env, ...PROD, PATH: `${shim}:${process.env.PATH}`, ...extra }, encoding: 'utf8' });
+    return { ...r, out, summary: existsSync(join(out, 'summary.json')) ? JSON.parse(readFileSync(join(out, 'summary.json'), 'utf8')) : {} };
+  };
+  return { d, g, head, fake, go, done: () => { rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); } };
+};
+test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (fake passwd home, throwaway clone, local fixtures)', opts, () => {
+  const before = fileSha(realAllow); const H = prodHarness();
+  try {
+    const r = H.go();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const s = r.summary, pinned = readFileSync(join(H.d, 'harness/stage-a-runner/policy.sha256'), 'utf8').trim();
+    assert.equal(s.result, 'completed'); assert.equal(s.test_mode, false);
+    assert.equal(s.commit_approved, true); assert.equal(s.approval_reason, 'approved'); assert.ok(s.approved_commits_file.startsWith(H.fake));
+    assert.equal(s.tree_clean, true); assert.equal(s.head_commit, H.head()); assert.equal(s.run_snapshot, `git-archive:${H.head()}`);
+    assert.match(s.snapshot_verified, /^ok \d+$/); assert.equal(s.snapshot_policy_sha256, pinned); assert.equal(s.policy_pinned_ok, true);
+    assert.equal(s.policy_matches_head, true); assert.equal(s.evidence_integrity, true);
+    assert.deepEqual(JSON.parse(readFileSync(join(r.out, 'browser/browse.json'), 'utf8')).map((x: any) => x.title), ['Page A']);
+    assert.ok(!readFileSync(join(r.out, 'docker-commands.txt'), 'utf8').includes(H.d + '/'), 'live clone never mounted');
+  } finally { H.done(); }
+  assert.equal(fileSha(realAllow), before, 'real APPROVED-COMMITS.txt untouched');
+  assert.equal(readFileSync(realAllow, 'utf8').split('\n').filter(l => /^[0-9a-f]{40}/.test(l)).length, 0, 'real allowlist still empty');
+});
+test('R6-1: skip-worktree / assume-unchanged hiding an edit to check-approval.py are refused in production', { timeout: 60_000 }, () => {
+  const H = prodHarness();
+  try {
+    const f = 'harness/stage-a-runner/check-approval.py';
+    appendFileSync(join(H.d, f), '\n# tampered\n');
+    for (const flag of ['--skip-worktree', '--assume-unchanged']) {
+      H.g('update-index', flag, f);
+      assert.equal(H.g('status', '--porcelain', '--', '.', ':(exclude)node_modules').stdout, '', `${flag} hides the edit from git status (precondition)`);
+      const r = H.go(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /skip-worktree\/assume-unchanged/);
+      H.g('update-index', flag.replace('--', '--no-'), f);
+    }
+  } finally { H.done(); }
+});
+test('R6-1: repo-local smudge filter / export-ignore altering the git-archive snapshot are refused (blob verification)', { timeout: 60_000 }, () => {
+  const H = prodHarness();
+  try {
+    const attrs = join(H.d, '.git/info/attributes'); mkdirSync(dirname(attrs), { recursive: true });
+    H.g('config', 'filter.rvx.smudge', "sh -c 'cat; echo // RVMARK'");
+    writeFileSync(attrs, 'harness/stage-a-runner/fixture.mjs filter=rvx\n');
+    let r = H.go(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /snapshot does not match HEAD tree \(mismatch content harness\/stage-a-runner\/fixture\.mjs\)/);
+    writeFileSync(attrs, 'harness/stage-a-runner/policy.json filter=rvx\n');
+    r = H.go(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /mismatch content harness\/stage-a-runner\/policy\.json/);
+    writeFileSync(attrs, 'harness/stage-a-runner/copyout.mjs export-ignore\n');
+    r = H.go(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /mismatch missing harness\/stage-a-runner\/copyout\.mjs/);
+    assert.equal(H.g('status', '--porcelain', '--', '.', ':(exclude)node_modules').stdout, '', 'tree looked clean throughout');
+  } finally { H.done(); }
+});
+test('R6-1: caller-injected git env (GIT_CONFIG_COUNT attributes+smudge, GIT_DIR, GIT_INDEX_FILE) is ignored in production', opts, () => {
+  const H = prodHarness(); const h = mkdtempSync(join(tmpdir(), 'r61env-'));
+  try {
+    writeFileSync(join(h, 'attr'), 'harness/stage-a-runner/fixture.mjs filter=rvx\n');
+    const r = H.go({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.attributesFile', GIT_CONFIG_VALUE_0: join(h, 'attr'), GIT_CONFIG_KEY_1: 'filter.rvx.smudge', GIT_CONFIG_VALUE_1: "sh -c 'cat; echo // RVMARK'",
+      GIT_DIR: join(h, 'bogus'), GIT_INDEX_FILE: join(h, 'bogus-index'), GIT_CEILING_DIRECTORIES: '/' });
+    assert.equal(r.status, 0, r.stdout + r.stderr); assert.match(r.summary.snapshot_verified, /^ok /); assert.equal(r.summary.run_snapshot, `git-archive:${H.head()}`);
+  } finally { H.done(); rmSync(h, { recursive: true, force: true }); }
+});

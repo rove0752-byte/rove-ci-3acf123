@@ -8,6 +8,13 @@
 # usage: run.sh <new-evidence-dir> <wall-seconds> <url...>
 set -u
 SELF=${0:A:h}; WT=${SELF:h:h}; source $WT/harness/a3-local/registry.sh; a3_init
+# R6-1: git runs with a sanitised environment: no caller GIT_* / PYTHON* variables, no system/global config, a private
+# empty HOME, and hooks / attributesFile / fsmonitor disabled. Repo-local config (filters in .git/config,
+# .git/info/attributes) cannot be fully disabled from the command line, so the snapshot is ALSO verified blob-by-blob.
+unset -m 'GIT_*'; unset -m 'PYTHON*'; export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+GHOME=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-ghome.XXXXXX") || exit 5
+trap 'rm -rf "$GHOME"' EXIT
+git() { HOME=$GHOME XDG_CONFIG_HOME=$GHOME command git -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false "$@"; }
 OUT=$1; WALL=$2; shift 2; URLS="$*"
 NM=$(readlink "$WT/node_modules" || print "$WT/node_modules")
 TEST=${STAGE_A_TEST:-0}
@@ -26,10 +33,18 @@ if [ "$POLICY_HEAD_OK" != 1 ] && [ "$TEST" != 1 ]; then echo "refused: policy.js
 # honoured only in test mode) and never inside any git repo/worktree (R5-3). See check-approval.py.
 DIRTY=$(git -C "$WT" status --porcelain --untracked-files=all -- . ':(exclude)node_modules' 2>&1)
 TREE_CLEAN=0; [ -z "$DIRTY" ] && [ -n "$HEAD_COMMIT" ] && TREE_CLEAN=1
+# R6-1: refuse index flags that hide edits from `git status` (skip-worktree S/s, assume-unchanged lowercase, etc.).
+HIDDEN=$(git -C "$WT" ls-files -v 2>&1 | grep -v '^H ' | head -3)
 OVERRIDE=""; [ "$TEST" = 1 ] && OVERRIDE=${STAGE_A_APPROVED_COMMITS:-}
-APPROVAL=$(python3 "$SELF/check-approval.py" "${HEAD_COMMIT:-none}" "$WT" "$OVERRIDE")
+# R6-1: in production the trusted helpers are extracted from HEAD (never the live tree) into the private GHOME.
+TRUSTED=$SELF
+if [ "$TEST" != 1 ]; then TRUSTED=$GHOME/trusted; mkdir -p "$TRUSTED"
+  for f in check-approval.py verify-snapshot.py; do git -C "$WT" cat-file blob "HEAD:harness/stage-a-runner/$f" > "$TRUSTED/$f" 2>/dev/null || { echo "refused: $f not in HEAD"; exit 8; }; done
+fi
+APPROVAL=$(HOME=$GHOME python3 "$TRUSTED/check-approval.py" "${HEAD_COMMIT:-none}" "$WT" "$OVERRIDE")
 AP=("${(@f)APPROVAL}"); COMMIT_OK=${AP[1]:-0}; APPROVED_SHA=${AP[2]:--}; APPROVAL_WHY=${AP[3]:-check-failed}; APPROVED=${AP[4]:-?}
 if [ "$TEST" != 1 ]; then
+  [ -z "$HIDDEN" ] || { echo "refused: index has skip-worktree/assume-unchanged (or other non-H) entries: ${HIDDEN//$'\n'/; }"; a3_log "stage-a refuse reason=index-flags"; exit 8; }
   [ "$TREE_CLEAN" = 1 ] || { echo "refused: working tree not clean (whole tree except node_modules; untracked counts) or no HEAD"; a3_log "stage-a refuse reason=tree-dirty"; exit 8; }
   [ "$COMMIT_OK" = 1 ] || { echo "refused: HEAD $HEAD_COMMIT is not an approved commit ($APPROVAL_WHY; allowlist $APPROVED)"; a3_log "stage-a refuse reason=commit-not-approved why=$APPROVAL_WHY head=$HEAD_COMMIT"; exit 8; }
 fi
@@ -50,12 +65,19 @@ else
   (cd "$WT" && git ls-files -z -co --exclude-standard -- . ':(exclude)node_modules' | tar -c --null -T - -f -) | tar -x -C "$SNAP" && SNAPKIND="worktree-copy"
 fi
 [ -n "${SNAPKIND:-}" ] && [ -f "$SNAP/harness/stage-a-runner/run.sh" ] || { echo "STOP: snapshot failed"; chmod -R u+w "$SNAP"; rm -rf "$SNAP"; exit 5; }
+SNAP_VERIFIED=not-applicable
+if [[ $SNAPKIND == git-archive:* ]]; then   # R6-1: every snapshot file must equal its blob in HEAD's tree
+  SV=$(HOME=$GHOME python3 "$TRUSTED/verify-snapshot.py" "$WT" "$HEAD_COMMIT" "$SNAP" 2>&1) && SNAP_VERIFIED="$SV" || {
+    echo "refused: snapshot does not match HEAD tree ($SV)"; a3_log "stage-a refuse reason=snapshot-mismatch $SV"; chmod -R u+w "$SNAP"; rm -rf "$SNAP"; exit 8; }
+fi
 RWT=$SNAP; RSELF=$SNAP/harness/stage-a-runner
+SNAP_POLICY_SHA=$(shasum -a 256 "$RSELF/policy.json" | cut -d' ' -f1)
 if [ "$TEST" != 1 ]; then RPOLICY=$RSELF/policy.json
-  [ "$(shasum -a 256 "$RPOLICY" | cut -d' ' -f1)" = "$PINNED" ] || { echo "refused: snapshot policy differs from pin"; chmod -R u+w "$SNAP"; rm -rf "$SNAP"; exit 8; }
+  # pin re-check inside the snapshot, against the pin as committed in HEAD (not the live file)
+  [ "$SNAP_POLICY_SHA" = "$HEAD_PIN" ] && [ "$SNAP_POLICY_SHA" = "$PINNED" ] || { echo "refused: snapshot policy differs from pin"; chmod -R u+w "$SNAP"; rm -rf "$SNAP"; exit 8; }
 else RPOLICY=$POLICY; fi
 chmod -R a-w "$SNAP"
-rmsnap() { [ -n "${SNAP:-}" ] && [ -d "$SNAP" ] && { chmod -R u+w "$SNAP"; rm -rf "$SNAP"; }; }   # our own private snapshot only
+rmsnap() { [ -n "${SNAP:-}" ] && [ -d "$SNAP" ] && { chmod -R u+w "$SNAP"; rm -rf "$SNAP"; }; rm -rf "$GHOME"; }   # our own private temp dirs only
 trap rmsnap EXIT
 NM_LOCK_SHA=$( [ -f "$NM/.package-lock.json" ] && shasum -a 256 "$NM/.package-lock.json" | cut -d' ' -f1 || print none)
 ID=$(date +%Y%m%d%H%M%S)-$$; F=rove-a3-${ID}1; P=rove-a3-${ID}2; B=rove-a3-${ID}3; NONCE=$(a3_nonce); VOL=rove-a3-sock-$ID; SVOL=rove-a3-scratch-$ID
@@ -159,7 +181,7 @@ docker volume rm $SVOL >/dev/null 2>&1
 left=$(docker ps -aq --filter label=rove.a3.nonce=$NONCE | wc -l | tr -d ' ')
 export SELF OUT
 summary() { # <integrity: pending|true|false> <detail>
-SELF=$RSELF python3 - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" "$SNAPKIND" "$NM_LOCK_SHA" <<'PY'
+SELF=$RSELF python3 - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" "$SNAPKIND" "$NM_LOCK_SHA" "$SNAP_VERIFIED" "$SNAP_POLICY_SHA" <<'PY'
 import json, sys, os, subprocess
 out, result, peak, left, start, test, psha, pinned, blob, integ, detail, headok, commit = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == '1', sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12] == '1', sys.argv[13]
 pd = os.path.join(out, 'proxy')
@@ -186,7 +208,7 @@ if test: result += '-TEST'
 s = {"result": result, "test_mode": test, "evidence_integrity": {"pending": None, "true": True, "false": False}[integ], "integrity_detail": detail,
      "integrity_checked_after_seal": integ != 'pending', "journal_ok": jok, "scratch_refused": refused, "scratch_copied": len(copy.get('copied', [])),
      "policy_sha256": psha, "policy_pinned_sha256": pinned, "policy_pinned_ok": psha == pinned, "policy_git_blob": blob, "policy_matches_head": headok, "head_commit": commit,
-     "commit_approved": sys.argv[14] == '1', "approval_reason": sys.argv[18], "approved_commits_file": sys.argv[15], "approved_commits_sha256": sys.argv[16], "tree_clean": sys.argv[17] == '1', "run_snapshot": sys.argv[19], "node_modules_lock_sha256": sys.argv[20],
+     "commit_approved": sys.argv[14] == '1', "approval_reason": sys.argv[18], "approved_commits_file": sys.argv[15], "approved_commits_sha256": sys.argv[16], "tree_clean": sys.argv[17] == '1', "run_snapshot": sys.argv[19], "node_modules_lock_sha256": sys.argv[20], "snapshot_verified": sys.argv[21], "snapshot_policy_sha256": sys.argv[22],
      "peak_memory_bytes": peak, "containers_left": left, "start_epoch": start, "blocks": pol.get("blocks", {}), "a_class_total": pol.get("aTotal", 0)}
 p = os.path.join(out, 'summary.json')
 if os.path.lexists(p): os.chmod(p, 0o600); os.unlink(p)
