@@ -15,17 +15,23 @@ const pages = {
   '/sub-redir': '<title>Subresource redirect</title><img src="/img-redir-off">',
   '/private/x': '<title>Disallowed</title>',
   '/private/public-ok': '<title>Allowed by longer Allow</title>',
+  '/bigs': '<title>Big subresources</title>' + [1, 2, 3, 4, 5].map(i => `<img src="/big?${i}">`).join(''),
+  '/files/a%2Fb': '<title>Encoded slash</title>',
 };
-const redirects = { '/redir-same': '/a', '/redir-cross': 'http://other.test/', '/redir-off': 'http://evil.test/', '/img-redir-off': 'http://evil.test/x.png' };
+const redirects = { '/loop': '/loop', '/redir-userinfo': 'http://evil.test@allowed.test/a', '/redir-port': 'http://allowed.test:81/a', '/redir-js': 'javascript:alert(1)', '/redir-same': '/a', '/redir-cross': 'http://other.test/', '/redir-off': 'http://evil.test/', '/img-redir-off': 'http://evil.test/x.png' };
 createServer((req, res) => {
   const host = (req.headers.host || '').split(':')[0];
   const path = new URL(req.url, 'http://x').pathname;
+  // Location header injection attempt: raw bytes, extra header smuggled after the Location value
+  if (path === '/redir-inject') { req.socket.end('HTTP/1.1 302 Found\r\nLocation: /a%0d%0aSet-Cookie:%20injected=1\r\nSet-Cookie: injected=2\r\nX-Evil: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'); return; }
+  if (path === '/robots.txt' && host === 'r5.test') { res.writeHead(500); return res.end(); }
+  if (path === '/robots.txt' && host === 'rhtml.test') { res.writeHead(200, { 'content-type': 'text/html' }); return res.end('<!doctype html><html>not robots</html>'); }
   if (path === '/robots.txt') { res.writeHead(robots[host] ? 200 : 404, { 'content-type': 'text/plain' }); return res.end(robots[host] || ''); }
   if (redirects[path]) { res.writeHead(302, { location: redirects[path], 'set-cookie': 'x=1' }); return res.end(); }
   if (path.startsWith('/img/')) { res.writeHead(200, { 'content-type': 'image/png' }); return res.end(Buffer.alloc(68)); }
   if (path === '/big') { res.writeHead(200, { 'content-type': 'application/octet-stream' }); return res.end(Buffer.alloc(6_000_000)); }
   if (path === '/hang') return;
-  const body = pages[path];
+  const body = pages[path] ?? pages[new URL(req.url, 'http://x').pathname.replace(/%2F/g, '%2F')];
   if (body == null) { res.writeHead(404); return res.end('not found'); }
   res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<!doctype html><html><body>${body}<p>host=${host}</p></body></html>`);
-}).listen(80, () => console.log('fixture listening'));
+}).listen(8081, '127.0.0.1', () => console.log('fixture listening'));

@@ -1,6 +1,16 @@
 {
-  "allow": ["allowed.test", "other.test", "private.test", "rebind.test", "mixed.test"],
-  "rate": { "perSecond": 2, "burst": 6, "queueMs": 5000 },
+  "allow": [
+    "allowed.test",
+    "other.test",
+    "private.test",
+    "rebind.test",
+    "mixed.test"
+  ],
+  "rate": {
+    "perSecond": 2,
+    "burst": 6,
+    "queueMs": 5000
+  },
   "crossOrigin": {
     "offListSubresource": "block",
     "aClassMax": 20,
@@ -8,14 +18,29 @@
     "sameOffListWindowMs": 60000,
     "topLevelRobotsConsecutive": 3,
     "bodyCapBytes": 5000000,
-    "bodyCapOccasions": 3
+    "bodyCapOccasions": 3,
+    "encodedSlash": "block",
+    "maxRedirects": 10
   },
   "dns": {
-    "allowed.test": ["45.0.0.10"],
-    "other.test": ["45.0.0.10"],
-    "private.test": ["10.0.0.5"],
-    "mixed.test": ["45.0.0.10,10.0.0.5"],
-    "rebind.test": ["45.0.0.10", "127.0.0.1"]
+    "allowed.test": [
+      "45.0.0.10"
+    ],
+    "other.test": [
+      "45.0.0.10"
+    ],
+    "private.test": [
+      "10.0.0.5"
+    ],
+    "mixed.test": [
+      "45.0.0.10,10.0.0.5"
+    ],
+    "rebind.test": [
+      "45.0.0.10",
+      "127.0.0.1"
+    ]
   },
-  "route": { "45.0.0.10": "10.89.1.10" }
+  "route": {
+    "45.0.0.10": "127.0.0.1:8081"
+  }
 }

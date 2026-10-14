@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,7 +24,7 @@ const run = (name: string, wall: number, urls: string[], extra: Record<string, s
     summary: JSON.parse(read('summary.json') || '{}'),
     lines: (f: string) => read(f).trim().split('\n').filter(Boolean).map(l => JSON.parse(l)),
     violation: () => {
-      const p = join(out, 'VIOLATION'); assert.ok(existsSync(p), 'VIOLATION produced');
+      const p = join(out, 'proxy', 'VIOLATION'); assert.ok(existsSync(p), 'VIOLATION produced');
       assert.ok(statSync(p).mtimeMs >= started, 'VIOLATION written by THIS run');
       return JSON.parse(readFileSync(p, 'utf8'));
     },
@@ -43,13 +43,13 @@ test('positive control: allowed hosts load; logs; limits; --network none browser
   const r = run('ok', 60, ['http://allowed.test/', 'http://allowed.test/a', 'http://other.test/']);
   assert.equal(r.code, 0, r.read('supervisor.log'));
   assert.equal(r.summary.result, 'completed');
-  assert.deepEqual(JSON.parse(r.read('browse.json')).map((x: any) => x.title), ['Allowed home', 'Page A', 'Allowed home']);
-  for (const l of r.lines('requests.jsonl')) for (const k of ['host', 'ip', 'status', 'bytes']) assert.ok(k in l, k);
-  assert.equal(r.lines('dns.jsonl').length, 2);
+  assert.deepEqual(JSON.parse(r.read('browser/browse.json')).map((x: any) => x.title), ['Allowed home', 'Page A', 'Allowed home']);
+  for (const l of r.lines('proxy/requests.jsonl')) for (const k of ['host', 'ip', 'status', 'bytes']) assert.ok(k in l, k);
+  assert.equal(r.lines('proxy/dns.jsonl').length, 2);
   assert.match(r.read('browser.inspect'), /^1000000000 1073741824 256 true true none\n?$/);
   assert.ok(r.summary.peak_memory_bytes > 10_000_000 && r.summary.peak_memory_bytes <= 1073741824);
   assert.equal(statSync(r.out).mode & 0o777, 0o700);
-  assert.equal(statSync(join(r.out, 'requests.jsonl')).mode & 0o777, 0o600);
+  assert.equal(statSync(join(r.out, 'proxy/requests.jsonl')).mode & 0o777, 0o600);
   assert.equal(statSync(join(r.out, 'summary.json')).mode & 0o777, 0o600);
   assert.equal(spawnSync('shasum', ['-a', '256', '-c', 'SHA256SUMS'], { cwd: r.out }).status, 0);
   nothingLeft(r);
@@ -103,10 +103,10 @@ for (const [name, urls, rule] of [
   test(`block-and-log: ${name} (${rule})`, opts, () => {
     const r = run(name, 60, [...urls]);
     assert.equal(r.code, 0, r.read('supervisor.log'));
-    assert.equal(existsSync(join(r.out, 'VIOLATION')), false);
+    assert.equal(existsSync(join(r.out, 'proxy', 'VIOLATION')), false);
     assert.equal(r.summary.result, 'completed-with-blocks');
     assert.ok(r.summary.blocks[rule] >= 1, JSON.stringify(r.summary.blocks));
-    const d = r.lines('decisions.jsonl').find(x => x.rule === rule)!;
+    const d = r.lines('proxy/decisions.jsonl').find(x => x.rule === rule)!;
     for (const k of ['t', 'host', 'path_raw', 'dest', 'class', 'rule', 'count']) assert.ok(k in d, k);
     assert.equal(d.class, 'A');
   });
@@ -115,10 +115,10 @@ for (const [name, urls, rule] of [
 const imgs = (n: number) => ({ parallel: true, reqs: Array.from({ length: n }, (_, i) => raw('allowed.test', `http://allowed.test/img/${i}.png`)) });
 test('rate: over-rate requests beyond the queue get 429 and are logged (A-class), run continues', opts, () => {
   const r = testRun('rate-block', 40, [], 'node /runner/tests/probe.mjs', JSON.stringify(imgs(24)));
-  assert.equal(existsSync(join(r.out, 'VIOLATION')), false);
-  assert.equal(r.summary.result, 'completed-with-blocks', r.read('supervisor.log'));
+  assert.equal(existsSync(join(r.out, 'proxy', 'VIOLATION')), false);
+  assert.equal(r.summary.result, 'completed-with-blocks-TEST', r.read('supervisor.log'));
   assert.ok(r.summary.blocks.rate >= 1 && r.summary.blocks.rate <= 20, JSON.stringify(r.summary.blocks));
-  assert.ok(JSON.parse(r.read('probe.json')).some((l: string) => / 429 /.test(l)));
+  assert.ok(JSON.parse(r.read('browser/probe.json')).some((l: string) => / 429 /.test(l)));
 });
 test('rate: sustained abuse (> aClassMax denials) terminates the run', opts, () => {
   const r = testRun('flood', 40, [], 'node /runner/tests/probe.mjs', JSON.stringify(imgs(60)));
@@ -128,29 +128,29 @@ test('rate: sustained abuse (> aClassMax denials) terminates the run', opts, () 
 
 test('rate: queueing serves a moderate burst instead of terminating (L3)', opts, () => {
   const r = run('rate-detail', 60, ['http://allowed.test/burst']);
-  const served = r.lines('requests.jsonl').filter(l => l.path?.startsWith('/img/') && l.status === 200).length;
+  const served = r.lines('proxy/requests.jsonl').filter(l => l.path?.startsWith('/img/') && l.status === 200).length;
   assert.ok(served >= 14, `served ${served} of 20 images via the queue`);
 });
 
 test('robots: Allow longest-match wins over a shorter Disallow', opts, () => {
   const r = run('robots-allow', 60, ['http://allowed.test/private/public-ok']);
   assert.equal(r.summary.result, 'completed');
-  assert.equal(JSON.parse(r.read('browse.json'))[0].title, 'Allowed by longer Allow');
+  assert.equal(JSON.parse(r.read('browser/browse.json'))[0].title, 'Allowed by longer Allow');
 });
 
 test('M7: same-host and allowed cross-host redirects are followed with Location forwarded and policed', opts, () => {
   const r = run('redirects', 60, ['http://allowed.test/redir-same', 'http://allowed.test/redir-cross']);
   assert.equal(r.summary.result, 'completed', r.read('supervisor.log'));
-  const b = JSON.parse(r.read('browse.json'));
+  const b = JSON.parse(r.read('browser/browse.json'));
   assert.deepEqual(b.map((x: any) => [x.final, x.title]), [['http://allowed.test/a', 'Page A'], ['http://other.test/', 'Allowed home']]);
-  assert.equal(r.lines('decisions.jsonl').filter(d => d.rule === 'redirect' && d.class === 'ok').length, 2);
+  assert.equal(r.lines('proxy/decisions.jsonl').filter(d => d.rule === 'redirect' && d.class === 'ok').length, 2);
 });
 
 // Raw-request bypass probes (test mode), each in its own run because each one terminates it.
 for (const [name, req, kind] of [
   ['enc-p', raw('allowed.test', 'http://allowed.test/%70rivate/x'), 'encoded-path-robots-bypass'],
   ['double-enc', raw('allowed.test', 'http://allowed.test/%2570rivate/x'), 'encoded-path-double-encoding'],
-  ['enc-slash', raw('allowed.test', 'http://allowed.test/a/..%2fprivate/x'), 'encoded-path-encoded-separator'],
+  ['enc-slash', raw('allowed.test', 'http://allowed.test/a/..%2fprivate/x'), 'encoded-path-dot-segment'], // N6: %2F + dot segment
   ['connect', 'CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n', 'connect-tunnel'],
   ['origin-form', raw('allowed.test', '/a'), 'origin-form'],
   ['host-mismatch', raw('evil.test', 'http://allowed.test/a'), 'host-header-mismatch'],
@@ -160,27 +160,27 @@ for (const [name, req, kind] of [
 ] as const) {
   test(`bypass probe terminates: ${name} (${kind})`, opts, () => {
     const r = testRun(name, 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([req]));
-    assert.equal(r.violation().kind, kind, r.read('decisions.jsonl'));
+    assert.equal(r.violation().kind, kind, r.read('proxy/decisions.jsonl'));
     nothingLeft(r);
   });
 }
 
 test('L3: trailing-dot host is canonicalised and allowed', opts, () => {
   const r = testRun('trailing-dot', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([raw('allowed.test.', 'http://allowed.test./a')]));
-  assert.match(JSON.parse(r.read('probe.json'))[0], /200/);
-  assert.equal(existsSync(join(r.out, 'VIOLATION')), false);
+  assert.match(JSON.parse(r.read('browser/probe.json'))[0], /200/);
+  assert.equal(existsSync(join(r.out, 'proxy', 'VIOLATION')), false);
 });
 
 test('DNS pinning: a rebinding answer on the second lookup is never used', opts, () => {
   const r = run('rebind', 60, ['http://rebind.test/', 'http://rebind.test/a']);
   assert.equal(r.code, 0);
-  assert.equal(r.lines('dns.jsonl').length, 1);
-  assert.ok(r.lines('requests.jsonl').every(l => l.ip === '45.0.0.10'));
+  assert.equal(r.lines('proxy/dns.jsonl').length, 1);
+  assert.ok(r.lines('proxy/requests.jsonl').every(l => l.ip === '45.0.0.10'));
 });
 
 test('M4: browser container reaches nothing but the proxy socket (gateways, fixture, internet, metadata, IPv6, DNS)', opts, () => {
   const r = testRun('isolation', 30, [], 'node /runner/tests/isolation-probe.mjs');
-  const p = JSON.parse(r.read('probe.json'));
+  const p = JSON.parse(r.read('browser/probe.json'));
   assert.equal(p.ifaces, 'lo');
   for (const [k, v] of Object.entries(p)) if (k !== 'ifaces' && k !== 'proxy_socket') assert.equal(v, 'blocked', k);
   assert.equal(p.proxy_socket, 'REACHED');
@@ -214,3 +214,168 @@ test('external kill (kill.sh) ends a hung run; nothing left behind; kill logged'
   assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /killed name=rove-a3-\d+-\d+3 container=/);
   assert.equal(JSON.parse(readFileSync(join(out, 'summary.json'), 'utf8')).containers_left, 0);
 });
+
+// ---- t26 verification findings ----
+test('N1: the browser cannot write evidence; only its scratch dir is writable (0600); integrity verified', opts, () => {
+  const cmd = `for f in /evidence/proxy/requests.jsonl /evidence/proxy/VIOLATION /evidence/summary.json /evidence/forged; do (echo forged >> $f) 2>/dev/null && echo "$f WRITABLE" || echo "$f denied"; done > /scratch/tamper.txt; rm -f /evidence/proxy/journal.chain 2>/dev/null; echo ok > /scratch/own.txt`;
+  const r = testRun('tamper', 30, [], cmd);
+  const t = r.read('browser/tamper.txt');
+  assert.doesNotMatch(t, /WRITABLE/, t);
+  assert.equal((t.match(/denied/g) ?? []).length, 4);
+  assert.ok(existsSync(join(r.out, 'proxy', 'journal.chain')), 'journal not deletable from the browser');
+  assert.equal(existsSync(join(r.out, 'forged')), false);
+  assert.equal(statSync(join(r.out, 'browser', 'own.txt')).mode & 0o777, 0o600);
+  assert.equal(r.summary.evidence_integrity, true, r.summary.integrity_detail);
+  assert.equal(spawnSync('shasum', ['-a', '256', '-c', 'SHA256SUMS'], { cwd: r.out }).status, 0);
+});
+
+test('N1: proxy evidence carries a verifiable hash chain (positive control run)', opts, () => {
+  const r = run('chain', 30, ['http://allowed.test/a']);
+  assert.equal(r.summary.evidence_integrity, true);
+  const lines = r.read('proxy/journal.chain').trim().split('\n');
+  assert.ok(lines.length >= 3 && lines.every(l => /^\S+\t(append|replace)\t[0-9a-f]{64}\t[0-9a-f]{64}$/.test(l)));
+});
+
+test('N5: non-default port terminates', opts, () => {
+  const r = testRun('port', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([raw('allowed.test:81', 'http://allowed.test:81/a')]));
+  assert.equal(r.violation().kind, 'port');
+});
+test('N5: percent-encoded hostname terminates', opts, () => {
+  const r = testRun('enc-host', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([raw('allowed.test', 'http://allowed%2etest/a')]));
+  assert.equal(r.violation().kind, 'encoded-host');
+});
+test('N5: malformed requests are counted (A-class) and reflected in the status', opts, () => {
+  const r = testRun('malformed', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([`GET http://allowed.test/a HTTP/1.1\r\nConnection: close\r\n\r\n`, `GET http://allo\twed.test/ HTTP/1.1\r\nHost: allo\twed.test\r\n\r\n`, `\x00\x01garbage\r\n\r\n`]));
+  assert.ok(r.summary.blocks['malformed-request'] >= 2, JSON.stringify(r.summary.blocks));
+  assert.equal(r.summary.result, 'completed-with-blocks-TEST');
+});
+
+test('N6: a plain %2F is block-and-log (A-class), not termination', opts, () => {
+  const r = run('enc-slash-block', 30, ['http://allowed.test/files/a%2Fb']);
+  assert.equal(existsSync(join(r.out, 'proxy', 'VIOLATION')), false);
+  assert.equal(r.summary.result, 'completed-with-blocks');
+  assert.equal(r.summary.blocks['encoded-slash'], 1);
+});
+test('N6: %2F combined with dot segments terminates', opts, () => {
+  const r = testRun('enc-slash-dot', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([raw('allowed.test', 'http://allowed.test/a%2F..%2Fprivate/x')]));
+  assert.match(r.violation().kind, /^encoded-path-(dot-segment|encoded-separator)$/);
+});
+
+test('N7: policy hash recorded; mismatch refused outside test mode; test mode marked; test mode refuses real hosts', opts, () => {
+  const pinned = readFileSync(join(here, 'policy.sha256'), 'utf8').trim();
+  const real = spawnSync('shasum', ['-a', '256', join(here, 'policy.json')], { encoding: 'utf8' }).stdout.split(' ')[0];
+  assert.equal(real, pinned, 'committed policy matches its pin');
+  const ok = run('pol-ok', 30, ['http://allowed.test/a']);
+  assert.equal(ok.summary.policy_sha256, pinned); assert.equal(ok.summary.policy_pinned_ok, true); assert.equal(ok.summary.test_mode, false);
+  const pol = JSON.parse(readFileSync(join(here, 'policy.json'), 'utf8'));
+  const loose = join(root, 'loose.json'); writeFileSync(loose, JSON.stringify({ ...pol, allow: [...pol.allow, 'evil.test'] }));
+  const d = join(mkdtempSync(join(root, 'pol-')), 'ev');
+  const r1 = spawnSync('zsh', [join(here, 'run.sh'), d, '30', 'http://allowed.test/a'], { env: { ...env, STAGE_A_POLICY: loose }, encoding: 'utf8' });
+  assert.equal(r1.status, 8); assert.match(r1.stdout, /does not match pinned/); assert.equal(existsSync(d), false);
+  const t = run('pol-test', 30, ['http://allowed.test/a'], { STAGE_A_TEST: '1', STAGE_A_POLICY: loose });
+  assert.equal(t.summary.test_mode, true); assert.equal(t.summary.policy_pinned_ok, false); assert.match(t.summary.result, /-TEST$/);
+  const realHost = join(root, 'realhost.json'); writeFileSync(realHost, JSON.stringify({ ...pol, allow: [...pol.allow, 'example.com'] }));
+  const r2 = spawnSync('zsh', [join(here, 'run.sh'), join(mkdtempSync(join(root, 'pol2-')), 'ev'), '30'], { env: { ...env, STAGE_A_TEST: '1', STAGE_A_POLICY: realHost }, encoding: 'utf8' });
+  assert.equal(r2.status, 7); assert.match(r2.stdout, /non-\.test hosts/);
+});
+
+test('L5: repeated oversized responses terminate (body-cap-repeat)', opts, () => {
+  const r = run('bigs', 60, ['http://allowed.test/bigs']);
+  assert.equal(r.violation().kind, 'body-cap-repeat');
+});
+test('L5: a redirect loop is cut off (A-class redirect-loop)', opts, () => {
+  const r = run('loop', 60, ['http://allowed.test/loop']);
+  assert.ok(r.summary.blocks['redirect-loop'] >= 1, JSON.stringify(r.summary));
+  assert.equal(existsSync(join(r.out, 'proxy', 'VIOLATION')), false);
+  assert.ok(r.lines('proxy/requests.jsonl').filter(l => l.path === '/loop').length <= 11);
+});
+test('L5: Location header injection does not smuggle headers; only the safe set is forwarded', opts, () => {
+  const r = testRun('inject', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify({ full: true, reqs: [raw('allowed.test', 'http://allowed.test/redir-inject')] }));
+  const h = JSON.parse(r.read('browser/probe.json'))[0] as string;
+  assert.match(h, /^HTTP\/1\.1 302/);
+  assert.ok(!h.split('\r\n').some(l => /^(set-cookie|x-evil):/i.test(l)), h);
+  const loc = h.split('\r\n').find(l => /^location:/i.test(l))!;
+  assert.equal(loc, 'location: http://allowed.test/a%0d%0aSet-Cookie:%20injected=1');
+});
+for (const [name, path] of [['redir-userinfo', '/redir-userinfo'], ['redir-port', '/redir-port'], ['redir-js', '/redir-js']] as const) {
+  test(`L5: top-level redirect to ${name} terminates`, opts, () => {
+    const r = run(name, 30, [`http://allowed.test${path}`]);
+    assert.equal(r.violation().kind, 'redirect-off-list');
+  });
+}
+
+test('gateway: no Docker networks; proxy --network none, fixture in the proxy netns; proxy reaches no gateway', opts, () => {
+  const r = testRun('proxy-isolation', 30, ['http://allowed.test/a'], 'node /runner/browse.mjs');
+  const r2 = run('proxy-probe', 30, [], { STAGE_A_TEST: '1', CMD: 'sleep 6', PROXY_PROBE: '1' });
+  const p = JSON.parse(r2.read('proxy/proxy-probe.json'));
+  for (const k of ['gw_up_111', 'gw_in_111', 'gw_up_2375', 'internet', 'dns8', 'metadata', 'desktop_vm', 'ipv6', 'host_internal', 'gateway_internal', 'public_dns', 'fixture_old_bridge']) assert.equal(p[k], 'blocked', k);
+  assert.equal(p.fixture_loopback, 'REACHED');
+  assert.equal(p.ifaces, 'lo');
+  const ci = r.read('containers.inspect').trim().split('\n').map(l => l.split(' '));
+  assert.deepEqual(ci.map(c => c[6].replace(/:.*/, '')), ['none', 'none', 'container']);
+  assert.ok(ci.every(c => c[7] === '["ALL"]' && c[8] === 'false'), 'caps dropped, not privileged');
+  assert.match(r.read('docker-commands.txt'), /--network none/);
+  assert.doesNotMatch(r.read('docker-commands.txt'), /--privileged|--cap-add/);
+});
+
+// ---- t27u ----
+const runOut = (r: Run) => r.out;
+test('t27u: sealed manifest detects post-run tampering of every evidence class', opts, () => {
+  const r = run('seal', 30, ['http://allowed.test/a']);
+  const verify = (d: string) => spawnSync('python3', [join(here, 'verify-evidence.py'), d], { encoding: 'utf8' });
+  assert.equal(verify(r.out).stdout.trim(), 'intact');
+  const cases: [string, (d: string) => void, RegExp][] = [
+    ['proxy log edited', d => { chmodSync(join(d, 'proxy/requests.jsonl'), 0o600); appendFileSync(join(d, 'proxy/requests.jsonl'), '{}\n'); }, /mismatch:requests\.jsonl/],
+    ['browser result edited', d => { chmodSync(join(d, 'browser/browse.json'), 0o600); writeFileSync(join(d, 'browser/browse.json'), '[]'); }, /changed:browser\/browse\.json/],
+    ['summary edited', d => { chmodSync(join(d, 'summary.json'), 0o600); writeFileSync(join(d, 'summary.json'), '{}'); }, /changed:summary\.json/],
+    ['file added', d => writeFileSync(join(d, 'browser/extra.txt'), 'x'), /file-set-changed/],
+    ['file deleted', d => rmSync(join(d, 'proxy.log')), /file-set-changed/],
+    ['journal truncated', d => { chmodSync(join(d, 'proxy/journal.chain'), 0o600); writeFileSync(join(d, 'proxy/journal.chain'), ''); }, /mismatch|unjournaled/],
+    ['manifest re-written without nonce', d => { chmodSync(join(d, 'MANIFEST.sealed'), 0o600); writeFileSync(join(d, 'MANIFEST.sealed'), readFileSync(join(d, 'MANIFEST.sealed'), 'utf8').replace(/SEAL \w+/, 'SEAL ' + '0'.repeat(64))); }, /seal-mismatch/],
+  ];
+  for (const [name, tamper, why] of cases) {
+    const d = mkdtempSync(join(root, 'tamper-copy-'));
+    spawnSync('cp', ['-Rp', r.out + '/.', d]);
+    assert.equal(verify(d).stdout.trim(), 'intact', `${name}: copy intact before tamper`);
+    tamper(d);
+    const v = verify(d);
+    assert.equal(v.status, 1, name); assert.match(v.stdout, why, name);
+  }
+});
+
+const polWith = (extra: object) => { const p = join(root, `pol-${Math.random().toString(36).slice(2)}.json`); const base = JSON.parse(readFileSync(join(here, 'policy.json'), 'utf8')); writeFileSync(p, JSON.stringify({ ...base, ...extra(base) })); return p; };
+test('rule: userinfo in request URL terminates', opts, () => {
+  const r = testRun('userinfo', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([raw('allowed.test', 'http://u:p@allowed.test/a')]));
+  assert.equal(r.violation().kind, 'userinfo');
+});
+test('rule: absolute https URL (scheme) terminates', opts, () => {
+  const r = testRun('scheme', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([raw('allowed.test', 'https://allowed.test/a')]));
+  assert.equal(r.violation().kind, 'scheme');
+});
+test('rule: unparseable absolute URL terminates (bad-url)', opts, () => {
+  const r = testRun('bad-url', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([raw('allowed.test', 'http://[bad/')]));
+  assert.match(r.violation().kind, /^(bad-url|malformed-request)$/);
+});
+test('rule: non-GET subresource is blocked and logged (A-class method)', opts, () => {
+  const r = testRun('post-sub', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([`POST http://allowed.test/a HTTP/1.1\r\nHost: allowed.test\r\nAccept: */*\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`]));
+  assert.equal(r.summary.blocks.method, 1); assert.equal(existsSync(join(r.out, 'proxy', 'VIOLATION')), false);
+});
+test('rule: >5 subresource attempts to one off-list host within 60 s terminates (off-list-repeat)', opts, () => {
+  const r = testRun('offlist-repeat', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify(Array.from({ length: 7 }, (_, i) => raw('evil.test', `http://evil.test/${i}.png`, 'Accept: image/png\r\n'))));
+  assert.equal(r.violation().kind, 'off-list-repeat');
+});
+test('rule: allowed host without a DNS answer is blocked (dns-nxdomain)', opts, () => {
+  const r = run('nxdomain', 30, ['http://nodns.test/'], { STAGE_A_TEST: '1', STAGE_A_POLICY: polWith((b: any) => ({ allow: [...b.allow, 'nodns.test'] })) });
+  assert.equal(r.summary.blocks['dns-nxdomain'], 1);
+});
+test('rule: upstream timeout is blocked and the run reports errors', opts, () => {
+  const r = run('upstream', 40, ['http://allowed.test/hang']);
+  assert.equal(r.summary.blocks['upstream-error'], 1); assert.equal(r.summary.result, 'completed-with-errors');
+});
+for (const host of ['r5.test', 'rhtml.test']) {
+  test(`t27u: robots.txt ${host === 'r5.test' ? '5xx' : 'returning HTML'} fails closed (everything disallowed)`, opts, () => {
+    const r = run('robots-' + host, 30, [`http://${host}/a`], { STAGE_A_TEST: '1', STAGE_A_POLICY: polWith((b: any) => ({ allow: [...b.allow, host], dns: { ...b.dns, [host]: ['45.0.0.10'] } })) });
+    assert.equal(r.summary.blocks.robots, 1, JSON.stringify(r.summary));
+    assert.ok(r.lines('proxy/decisions.jsonl').some(d => d.rule === 'robots-fail-closed'));
+  });
+}

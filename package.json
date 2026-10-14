@@ -17,7 +17,7 @@
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "test:all": "npm test && npm run test:a3-safety && npm run test:stage-a-runner",
     "test:a3-safety": "node --experimental-strip-types --test harness/a3-local/tests/safety.test.ts",
-    "test:stage-a-runner": "node --experimental-strip-types --test --test-concurrency=1 harness/stage-a-runner/tests/runner.test.ts",
+    "test:stage-a-runner": "node --experimental-strip-types --test --test-concurrency=1 harness/stage-a-runner/tests/robots.test.ts harness/stage-a-runner/tests/runner.test.ts",
     "test:schema": "node --experimental-strip-types scripts/verify-eve-output-schema.mjs",
     "cloud:start": "node --experimental-strip-types cloud/server.ts",
     "cloud:worker": "node --experimental-strip-types cloud/run-worker.ts",
