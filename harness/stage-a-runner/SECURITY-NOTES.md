@@ -47,3 +47,22 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
   - Anyone who can write the allowlist, or set STAGE_A_APPROVED_COMMITS, at the user's own uid can approve a commit. That is the same trust level as Docker access. The control is that the path and sha256 are recorded in every summary.
   - The sweep still trusts Docker labels. Anyone with Docker access can forge `rove-a3-`-named resources.
   - Test mode (STAGE_A_TEST=1) skips the approval check by design. Its results are always suffixed `-TEST`.
+
+## Round 5 changes (builder claims, pending independent re-verification; R4-2 condition per D-28)
+- R5-1: production's clean-tree check now covers the WHOLE tree: `git status --porcelain --untracked-files=all -- . ':(exclude)node_modules'`. Modified and untracked files count, including agent/lib.
+- R5-2: STAGE_A_APPROVED_COMMITS is honoured ONLY in test mode. Production always reads `<passwd home>/rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt`, taken from getpwuid, not $HOME. That file is empty, so production refuses everything.
+- R5-3: `check-approval.py` refuses an allowlist whose real directory is inside ANY git repo, worktree or `.git` dir (`git -C <dir> rev-parse --git-dir`; covers ~/rove and ~/rove-wt/*). It also refuses symlinks, group/world-writable files, files owned by another uid, and anything inside the current worktree.
+- R5-4: containers no longer mount the live worktree.
+  - After the checks, production extracts `git archive HEAD` into a private, read-only `$TMPDIR/rove-a3-snap-<pid>.*` and re-verifies the snapshot's policy against the pin.
+  - /app (proxy), /runner (browser), fixture.mjs and copyout.mjs, and the host-side verify-evidence.py all come from the snapshot.
+  - Test mode copies the working files (tracked + untracked, not ignored) unless `STAGE_A_TEST_SNAPSHOT=git-archive`.
+  - summary.json records `run_snapshot` and `node_modules_lock_sha256`. The snapshot is removed on EXIT.
+- Remaining TOCTOU / residual risks, all same-user trust:
+  - run.sh, registry.sh/kill.sh and check-approval.py run from the live tree. A same-user process could still swap them between `git status` and their execution.
+  - node_modules is a live read-only mount outside git. Only its `.package-lock.json` hash is recorded; package contents aren't verified.
+  - Compensating controls: the whole-tree clean check; head_commit, run_snapshot and node_modules_lock_sha256 recorded in the sealed evidence; an empty allowlist; NO-GO for live mode.
+  - A SIGKILLed supervisor leaves its snapshot dir in $TMPDIR (no secrets; read-only copy of tracked files).
+- Test-suite consequence: production can no longer be run end-to-end by the suite, because the allowlist is fixed and empty and adding entries needs Jacko's approval.
+  - Runs default to test mode (results carry `-TEST`).
+  - Production is tested on its refusal paths.
+  - The approval logic is tested by calling check-approval.py directly.

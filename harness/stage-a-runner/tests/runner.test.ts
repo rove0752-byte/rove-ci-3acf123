@@ -10,10 +10,12 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(dirname(fileURLToPath(import.meta.url)));
 const root = mkdtempSync(join(process.env.STAGE_A_EVIDENCE_PARENT ?? tmpdir(), 'stage-a-'));
-// R4-2: production-mode runs need HEAD in an approved-commits allowlist outside the repo; tests use a per-suite temp one.
+// R5-2: production mode reads ONLY the fixed default allowlist (empty: nothing is approved), so it cannot be exercised
+// end-to-end by the suite. Runs therefore default to test mode (results carry -TEST); production is exercised for its
+// refusal paths (PROD = { STAGE_A_TEST: '' }) and the approval logic is unit-tested via check-approval.py.
 const headId = spawnSync('git', ['-C', dirname(dirname(here)), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
-const approvedFile = join(root, 'approved-commits.txt'); writeFileSync(approvedFile, `${headId} test-suite\n`, { mode: 0o600 });
-const env = { ...process.env, STAGE_A_APPROVED_COMMITS: approvedFile, A3_REGISTRY: join(root, 'registry'), A3_KILL_LOG: join(root, 'kill.log'), CMD: '', PROBE: '', STAGE_A_TEST: '' };
+const PROD = { STAGE_A_TEST: '' };
+const env = { ...process.env, A3_REGISTRY: join(root, 'registry'), A3_KILL_LOG: join(root, 'kill.log'), CMD: '', PROBE: '', STAGE_A_TEST: '1' };
 const ok = spawnSync('docker', ['image', 'inspect', 'rove-browser-pilot:local', 'node:24-bookworm-slim']).status === 0;
 const opts = { skip: !ok && 'local images not present', timeout: 120_000 };
 type Run = { code: number | null; out: string; started: number; stdout: string; read: (f: string) => string; summary: any; lines: (f: string) => any[]; violation: () => any };
@@ -47,7 +49,7 @@ const raw = (host: string, target: string, extra = '') => `GET ${target} HTTP/1.
 test('positive control: allowed hosts load; logs; limits; --network none browser; evidence 0700/0600; checksums', opts, () => {
   const r = run('ok', 60, ['http://allowed.test/', 'http://allowed.test/a', 'http://other.test/']);
   assert.equal(r.code, 0, r.read('supervisor.log'));
-  assert.equal(r.summary.result, 'completed');
+  assert.equal(r.summary.result, 'completed-TEST');
   assert.deepEqual(JSON.parse(r.read('browser/browse.json')).map((x: any) => x.title), ['Allowed home', 'Page A', 'Allowed home']);
   for (const l of r.lines('proxy/requests.jsonl')) for (const k of ['host', 'ip', 'status', 'bytes']) assert.ok(k in l, k);
   assert.equal(r.lines('proxy/dns.jsonl').length, 2);
@@ -75,7 +77,7 @@ test('H4: a non-empty evidence dir is refused (stale VIOLATION can never be read
 test('M2: CMD/PROBE hooks are refused outside test mode', opts, () => {
   for (const extra of [{ CMD: 'id' }, { PROBE: '[]' }]) {
     const d = join(mkdtempSync(join(root, 'm2-')), 'ev');
-    const r = spawnSync('zsh', [join(here, 'run.sh'), d, '30', 'http://allowed.test/'], { env: { ...env, ...extra }, encoding: 'utf8' });
+    const r = spawnSync('zsh', [join(here, 'run.sh'), d, '30', 'http://allowed.test/'], { env: { ...env, ...PROD, ...extra }, encoding: 'utf8' });
     assert.equal(r.status, 7, JSON.stringify(extra));
     assert.equal(existsSync(d), false, 'nothing started');
   }
@@ -111,7 +113,7 @@ for (const [name, urls, rule] of [
     const r = run(name, 60, [...urls]);
     assert.equal(r.code, 0, r.read('supervisor.log'));
     assert.equal(existsSync(join(r.out, 'proxy', 'VIOLATION')), false);
-    assert.equal(r.summary.result, 'completed-with-blocks');
+    assert.equal(r.summary.result, 'completed-with-blocks-TEST');
     assert.ok(r.summary.blocks[rule] >= 1, JSON.stringify(r.summary.blocks));
     const d = r.lines('proxy/decisions.jsonl').find(x => x.rule === rule)!;
     for (const k of ['t', 'host', 'path_raw', 'dest', 'class', 'rule', 'count']) assert.ok(k in d, k);
@@ -141,13 +143,13 @@ test('rate: queueing serves a moderate burst instead of terminating (L3)', opts,
 
 test('robots: Allow longest-match wins over a shorter Disallow', opts, () => {
   const r = run('robots-allow', 60, ['http://allowed.test/private/public-ok']);
-  assert.equal(r.summary.result, 'completed');
+  assert.equal(r.summary.result, 'completed-TEST');
   assert.equal(JSON.parse(r.read('browser/browse.json'))[0].title, 'Allowed by longer Allow');
 });
 
 test('M7: same-host and allowed cross-host redirects are followed with Location forwarded and policed', opts, () => {
   const r = run('redirects', 60, ['http://allowed.test/redir-same', 'http://allowed.test/redir-cross']);
-  assert.equal(r.summary.result, 'completed', r.read('supervisor.log'));
+  assert.equal(r.summary.result, 'completed-TEST', r.read('supervisor.log'));
   const b = JSON.parse(r.read('browser/browse.json'));
   assert.deepEqual(b.map((x: any) => [x.final, x.title]), [['http://allowed.test/a', 'Page A'], ['http://other.test/', 'Allowed home']]);
   assert.equal(r.lines('proxy/decisions.jsonl').filter(d => d.rule === 'redirect' && d.class === 'ok').length, 2);
@@ -201,7 +203,7 @@ test('memory and pids limits hold; peak memory captured', opts, () => {
 
 test('L4: a hung URL is reported completed-with-errors, not completed', opts, () => {
   const r = run('hang-errors', 40, ['http://allowed.test/hang']);
-  assert.equal(r.summary.result, 'completed-with-errors', r.read('supervisor.log'));
+  assert.equal(r.summary.result, 'completed-with-errors-TEST', r.read('supervisor.log'));
 });
 
 test('wall clock kills a hung run and logs it', opts, () => {
@@ -260,7 +262,7 @@ test('N5: malformed requests are counted (A-class) and reflected in the status',
 test('N6: a plain %2F is block-and-log (A-class), not termination', opts, () => {
   const r = run('enc-slash-block', 30, ['http://allowed.test/files/a%2Fb']);
   assert.equal(existsSync(join(r.out, 'proxy', 'VIOLATION')), false);
-  assert.equal(r.summary.result, 'completed-with-blocks');
+  assert.equal(r.summary.result, 'completed-with-blocks-TEST');
   assert.equal(r.summary.blocks['encoded-slash'], 1);
 });
 test('N6: %2F combined with dot segments terminates', opts, () => {
@@ -273,11 +275,11 @@ test('N7: policy hash recorded; mismatch refused outside test mode; test mode ma
   const real = spawnSync('shasum', ['-a', '256', join(here, 'policy.json')], { encoding: 'utf8' }).stdout.split(' ')[0];
   assert.equal(real, pinned, 'committed policy matches its pin');
   const ok = run('pol-ok', 30, ['http://allowed.test/a']);
-  assert.equal(ok.summary.policy_sha256, pinned); assert.equal(ok.summary.policy_pinned_ok, true); assert.equal(ok.summary.test_mode, false);
+  assert.equal(ok.summary.policy_sha256, pinned); assert.equal(ok.summary.policy_pinned_ok, true); assert.equal(ok.summary.test_mode, true);
   const pol = JSON.parse(readFileSync(join(here, 'policy.json'), 'utf8'));
   const loose = join(root, 'loose.json'); writeFileSync(loose, JSON.stringify({ ...pol, allow: [...pol.allow, 'evil.test'] }));
   const d = join(mkdtempSync(join(root, 'pol-')), 'ev');
-  const r1 = spawnSync('zsh', [join(here, 'run.sh'), d, '30', 'http://allowed.test/a'], { env: { ...env, STAGE_A_POLICY: loose }, encoding: 'utf8' });
+  const r1 = spawnSync('zsh', [join(here, 'run.sh'), d, '30', 'http://allowed.test/a'], { env: { ...env, ...PROD, STAGE_A_POLICY: loose }, encoding: 'utf8' });
   assert.equal(r1.status, 8); assert.match(r1.stdout, /does not match pinned/); assert.equal(existsSync(d), false);
   const t = run('pol-test', 30, ['http://allowed.test/a'], { STAGE_A_TEST: '1', STAGE_A_POLICY: loose });
   assert.equal(t.summary.test_mode, true); assert.equal(t.summary.policy_pinned_ok, false); assert.match(t.summary.result, /-TEST$/);
@@ -377,7 +379,7 @@ test('rule: allowed host without a DNS answer is blocked (dns-nxdomain)', opts, 
 });
 test('rule: upstream timeout is blocked and the run reports errors', opts, () => {
   const r = run('upstream', 40, ['http://allowed.test/hang']);
-  assert.equal(r.summary.blocks['upstream-error'], 1); assert.equal(r.summary.result, 'completed-with-errors');
+  assert.equal(r.summary.blocks['upstream-error'], 1); assert.equal(r.summary.result, 'completed-with-errors-TEST');
 });
 for (const host of ['r5.test', 'rhtml.test']) {
   test(`t27u: robots.txt ${host === 'r5.test' ? '5xx' : 'returning HTML'} fails closed (everything disallowed)`, opts, () => {
@@ -448,13 +450,13 @@ test('R3-7: policy.json + policy.sha256 edited together (uncommitted) are refuse
     writeFileSync(pj, readFileSync(pj, 'utf8').replace('"maxRedirects": 10', '"maxRedirects": 11'));
     const sha = spawnSync('shasum', ['-a', '256', pj], { encoding: 'utf8' }).stdout.split(' ')[0];
     writeFileSync(join(d, 'harness/stage-a-runner/policy.sha256'), sha + '\n');
-    const r = spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), join(d, 'ev'), '30'], { env: { ...env }, encoding: 'utf8' });
+    const r = spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), join(d, 'ev'), '30'], { env: { ...env, ...PROD }, encoding: 'utf8' });
     assert.equal(r.status, 8, r.stdout + r.stderr); assert.match(r.stdout, /differ from committed HEAD/);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
 // ---- Round 4 ----
-const prodRun = (dir: string, extra: Record<string, string> = {}) => spawnSync('zsh', [join(dir, 'harness/stage-a-runner/run.sh'), join(mkdtempSync(join(tmpdir(), 'r4ev-')), 'ev'), '30'], { env: { ...env, ...extra }, encoding: 'utf8' });
+const prodRun = (dir: string, extra: Record<string, string> = {}) => spawnSync('zsh', [join(dir, 'harness/stage-a-runner/run.sh'), join(mkdtempSync(join(tmpdir(), 'r4ev-')), 'ev'), '30'], { env: { ...env, ...PROD, ...extra }, encoding: 'utf8' });
 const scratchClone = () => {
   const d = mkdtempSync(join(tmpdir(), 'r42-'));
   const g = (...a: string[]) => spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: d, encoding: 'utf8' });
@@ -478,27 +480,75 @@ test('R4-2: a detached, unreviewed commit with a loosened (re-pinned) policy is 
     assert.equal(r.status, 8, r.stdout + r.stderr); assert.match(r.stdout, /is not an approved commit \(head-not-approved/);
   } finally { rmSync(d, { recursive: true, force: true }); rmSync(dirname(allow), { recursive: true, force: true }); }
 });
-test('R4-2: dirty tree, missing / in-repo / symlinked / world-writable allowlists are refused', { timeout: 60_000 }, () => {
-  const { d, head } = scratchClone(); const ad = mkdtempSync(join(tmpdir(), 'r42b-'));
+const approval = (head: string, path: string, wt = dirname(dirname(here))) => spawnSync('python3', [join(here, 'check-approval.py'), head, wt, path], { encoding: 'utf8' }).stdout.split('\n');
+test('R4-2/R5-3: allowlist checks (missing, symlink, world-/group-writable, in-repo, inside ANY git repo/worktree/.git, approved)', { timeout: 60_000 }, () => {
+  const { d, g, head } = scratchClone(); const ad = mkdtempSync(join(tmpdir(), 'r42b-')); const h = head();
   try {
-    const good = join(ad, 'ok.txt'); writeFileSync(good, head() + '\n', { mode: 0o600 });
+    const good = join(ad, 'ok.txt'); writeFileSync(good, h + ' D-test\n', { mode: 0o600 });
     const link = join(ad, 'link.txt'); spawnSync('ln', ['-s', good, link]);
-    const ww = join(ad, 'ww.txt'); writeFileSync(ww, head() + '\n'); chmodSync(ww, 0o666);
-    for (const [f, why] of [[join(ad, 'none.txt'), 'allowlist-missing'], [link, 'allowlist-not-regular'], [ww, 'allowlist-bad-owner-or-mode']] as const) {
-      const r = prodRun(d, { STAGE_A_APPROVED_COMMITS: f }); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, new RegExp(why));
+    const ww = join(ad, 'ww.txt'); writeFileSync(ww, h + '\n'); chmodSync(ww, 0o602);
+    const gw = join(ad, 'gw.txt'); writeFileSync(gw, h + '\n'); chmodSync(gw, 0o620);
+    const inRepo = join(d, '.approved'); writeFileSync(inRepo, h + '\n', { mode: 0o600 });
+    const other = mkdtempSync(join(tmpdir(), 'r53repo-')); spawnSync('git', ['init', '-q', other]);
+    const inOther = join(other, 'sub'); mkdirSync(inOther); writeFileSync(join(inOther, 'a.txt'), h + '\n', { mode: 0o600 });
+    writeFileSync(join(other, '.git', 'a.txt'), h + '\n', { mode: 0o600 });
+    const wtDir = join(ad, 'linked-wt'); g('worktree', 'add', '-q', '--detach', wtDir); writeFileSync(join(wtDir, 'a.txt'), h + '\n', { mode: 0o600 });
+    for (const [f, why] of [[join(ad, 'none.txt'), 'allowlist-missing'], [link, 'allowlist-not-regular'], [ww, 'allowlist-bad-owner-or-mode'], [gw, 'allowlist-bad-owner-or-mode'],
+      [inRepo, 'allowlist-inside-repo'], [join(inOther, 'a.txt'), 'allowlist-inside-git'], [join(other, '.git', 'a.txt'), 'allowlist-inside-git'], [join(wtDir, 'a.txt'), 'allowlist-inside-git']] as const) {
+      const [ok, , reason] = approval(h, f, d); assert.equal(ok, '0', f); assert.equal(reason, why, f);
     }
-    writeFileSync(join(d, '.approved'), head() + '\n', { mode: 0o600 });
-    let r = prodRun(d, { STAGE_A_APPROVED_COMMITS: join(d, '.approved') });
-    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /allowlist-inside-repo/);
-    writeFileSync(join(d, 'harness', 'stray.txt'), 'x');   // untracked file under harness/ = dirty tree
-    r = prodRun(d, { STAGE_A_APPROVED_COMMITS: good });
-    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /not clean/);
+    const [ok, sha, reason, path] = approval(h, good, d);
+    assert.deepEqual([ok, reason, path], ['1', 'approved', good]); assert.match(sha, /^[0-9a-f]{64}$/);
+    assert.equal(approval('a'.repeat(40), good, d)[2], 'head-not-approved');
+    assert.equal(approval(h.slice(0, 12), good, d)[2], 'no-head');
+    rmSync(other, { recursive: true, force: true }); g('worktree', 'remove', '--force', wtDir);
   } finally { rmSync(d, { recursive: true, force: true }); rmSync(ad, { recursive: true, force: true }); }
 });
-test('R4-2: an approved HEAD on a clean tree passes and is recorded', opts, () => {
-  const r = run('approved', 30, ['http://allowed.test/a']);
-  assert.equal(r.code, 0, r.stdout); assert.equal(r.summary.commit_approved, true); assert.equal(r.summary.tree_clean, true);
-  assert.equal(r.summary.head_commit, headId); assert.match(r.summary.approved_commits_sha256, /^[0-9a-f]{64}$/);
+test('R5-1: production refuses a dirty or untracked file ANYWHERE in the tree (agent/lib/public-address.ts)', { timeout: 60_000 }, () => {
+  const { d } = scratchClone();
+  try {
+    const f = join(d, 'agent/lib/public-address.ts'); assert.ok(existsSync(f));
+    const orig = readFileSync(f, 'utf8');
+    writeFileSync(f, orig + '\n// unreviewed change\n');
+    let r = prodRun(d); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /not clean/);
+    writeFileSync(f, orig);
+    writeFileSync(join(d, 'agent/lib/untracked-helper.ts'), 'export {}\n');
+    r = prodRun(d); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /not clean/);
+    rmSync(join(d, 'agent/lib/untracked-helper.ts'));
+    spawnSync('ln', ['-s', '/nonexistent-nm', join(d, 'node_modules')]);   // node_modules alone is excluded from the check
+    r = prodRun(d); assert.equal(r.status, 8, r.stdout); assert.doesNotMatch(r.stdout, /not clean/); assert.match(r.stdout, /not an approved commit/);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+test('R5-2: STAGE_A_APPROVED_COMMITS is ignored in production (fixed default allowlist is used)', { timeout: 60_000 }, () => {
+  const { d, head } = scratchClone(); const ad = mkdtempSync(join(tmpdir(), 'r52-'));
+  try {
+    const mine = join(ad, 'mine.txt'); writeFileSync(mine, head() + ' self-approved\n', { mode: 0o600 });
+    assert.equal(approval(head(), mine, d)[0], '1', 'the file itself would approve HEAD');
+    const r = prodRun(d, { STAGE_A_APPROVED_COMMITS: mine });
+    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /head-not-approved; allowlist .*rove-recovery-evidence\/stage-a-runner\/APPROVED-COMMITS\.txt\)/);
+    assert.doesNotMatch(r.stdout, new RegExp(mine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally { rmSync(d, { recursive: true, force: true }); rmSync(ad, { recursive: true, force: true }); }
+});
+test('R5-4: containers run from a snapshot, not the live tree (git archive excludes uncommitted edits)', opts, () => {
+  const { d } = scratchClone();
+  try {
+    const nmLive = join(dirname(dirname(here)), 'node_modules');
+    spawnSync('ln', ['-s', spawnSync('readlink', [nmLive], { encoding: 'utf8' }).stdout.trim() || nmLive, join(d, 'node_modules')]);
+    appendFileSync(join(d, 'harness/stage-a-runner/fixture.mjs'), '\n// R54MARK\n');
+    const cmd = 'grep -c R54MARK /runner/fixture.mjs > /scratch/m.txt; true';
+    const go = (extra: Record<string, string>) => {
+      const out = join(mkdtempSync(join(root, 'r54-')), 'ev');
+      spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), out, '30'], { env: { ...env, CMD: cmd, ...extra }, encoding: 'utf8' });
+      return { m: existsSync(join(out, 'browser/m.txt')) ? readFileSync(join(out, 'browser/m.txt'), 'utf8').trim() : 'missing', s: JSON.parse(readFileSync(join(out, 'summary.json'), 'utf8')), out };
+    };
+    const a = go({ STAGE_A_TEST_SNAPSHOT: 'git-archive' });
+    assert.equal(a.m, '0', 'uncommitted edit NOT visible'); assert.match(a.s.run_snapshot, /^git-archive:[0-9a-f]{40}$/);
+    assert.match(a.s.node_modules_lock_sha256, /^[0-9a-f]{64}$/);
+    assert.doesNotMatch(readFileSync(join(a.out, 'docker-commands.txt'), 'utf8'), new RegExp(`-v ${d.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[/:]`), 'live tree never mounted');
+    const b = go({});
+    assert.equal(b.m, '1', 'test-mode worktree copy includes the edit'); assert.equal(b.s.run_snapshot, 'worktree-copy');
+    assert.equal(spawnSync('sh', ['-c', `ls -d "\${TMPDIR:-/tmp}"/rove-a3-snap-* 2>/dev/null | wc -l`], { encoding: 'utf8' }).stdout.trim(), '0', 'snapshots removed');
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });
 test('R4-1: control-character / newline / space filenames are refused (bad-name); final result logged after verification', opts, () => {
   const r = testRun('badname', 30, [], `touch "/scratch/a$(printf '\\nresult=completed')" "/scratch/sp ace" /scratch/ok-1.txt`);

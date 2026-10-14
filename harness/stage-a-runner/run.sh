@@ -21,32 +21,16 @@ HEAD_COMMIT=$(git -C "$WT" rev-parse HEAD 2>/dev/null)
 POLICY_HEAD_OK=0; [ -n "$HEAD_BLOB" ] && [ "$POLICY_BLOB" = "$HEAD_BLOB" ] && [ "$HEAD_PIN" = "$PINNED" ] && POLICY_HEAD_OK=1
 if [ "$POLICY_SHA" != "$PINNED" ] && [ "$TEST" != 1 ]; then echo "refused: policy sha256 $POLICY_SHA does not match pinned $PINNED"; a3_log "stage-a refuse reason=policy-hash-mismatch"; exit 8; fi
 if [ "$POLICY_HEAD_OK" != 1 ] && [ "$TEST" != 1 ]; then echo "refused: policy.json/policy.sha256 differ from committed HEAD ($HEAD_COMMIT)"; a3_log "stage-a refuse reason=policy-not-committed"; exit 8; fi
-# R4-2: production mode runs only an APPROVED commit from a clean tree. The allowlist lives outside the repo (and outside
-# every container mount), must be a regular non-symlink file owned by this user and not group/world-writable, and must
-# list HEAD's full 40-hex id exactly. Its path + sha256 are recorded in summary.json.
-APPROVED=${STAGE_A_APPROVED_COMMITS:-$HOME/rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt}
-DIRTY=$(git -C "$WT" status --porcelain --untracked-files=all -- harness .github package.json package-lock.json tsconfig.json 2>&1)
+# R4-2/R5: production runs only an APPROVED commit from a WHOLE-tree-clean checkout (R5-1: everything except
+# node_modules, untracked files count), with the allowlist at its fixed default path (R5-2: STAGE_A_APPROVED_COMMITS is
+# honoured only in test mode) and never inside any git repo/worktree (R5-3). See check-approval.py.
+DIRTY=$(git -C "$WT" status --porcelain --untracked-files=all -- . ':(exclude)node_modules' 2>&1)
 TREE_CLEAN=0; [ -z "$DIRTY" ] && [ -n "$HEAD_COMMIT" ] && TREE_CLEAN=1
-APPROVAL=$(python3 - "$APPROVED" "$WT" "${HEAD_COMMIT:-none}" <<'PY'
-import os, re, stat, sys, hashlib
-p, wt, head = sys.argv[1], os.path.realpath(sys.argv[2]), sys.argv[3]
-def out(ok, why, sha=''): print(f"{ok} {sha or '-'} {why}"); sys.exit(0)
-try: st = os.lstat(p)
-except OSError: out(0, 'allowlist-missing')
-if not stat.S_ISREG(st.st_mode): out(0, 'allowlist-not-regular')
-rp = os.path.realpath(p)
-if rp == wt or rp.startswith(wt + os.sep): out(0, 'allowlist-inside-repo')
-if st.st_uid != os.getuid() or st.st_mode & 0o022: out(0, 'allowlist-bad-owner-or-mode')
-fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW); data = os.read(fd, 1 << 20); os.close(fd)
-sha = hashlib.sha256(data).hexdigest()
-if not re.fullmatch(r'[0-9a-f]{40}', head): out(0, 'no-head', sha)
-ids = {m.group(1) for l in data.decode('utf-8', 'replace').splitlines() if (m := re.match(r'([0-9a-f]{40})(\s|$)', l))}
-out(1 if head in ids else 0, 'approved' if head in ids else 'head-not-approved', sha)
-PY
-)
-COMMIT_OK=${APPROVAL%% *}; APPROVED_SHA=${${APPROVAL#* }%% *}; APPROVAL_WHY=${APPROVAL##* }
+OVERRIDE=""; [ "$TEST" = 1 ] && OVERRIDE=${STAGE_A_APPROVED_COMMITS:-}
+APPROVAL=$(python3 "$SELF/check-approval.py" "${HEAD_COMMIT:-none}" "$WT" "$OVERRIDE")
+AP=("${(@f)APPROVAL}"); COMMIT_OK=${AP[1]:-0}; APPROVED_SHA=${AP[2]:--}; APPROVAL_WHY=${AP[3]:-check-failed}; APPROVED=${AP[4]:-?}
 if [ "$TEST" != 1 ]; then
-  [ "$TREE_CLEAN" = 1 ] || { echo "refused: working tree not clean under harness/ (or no HEAD)"; a3_log "stage-a refuse reason=tree-dirty"; exit 8; }
+  [ "$TREE_CLEAN" = 1 ] || { echo "refused: working tree not clean (whole tree except node_modules; untracked counts) or no HEAD"; a3_log "stage-a refuse reason=tree-dirty"; exit 8; }
   [ "$COMMIT_OK" = 1 ] || { echo "refused: HEAD $HEAD_COMMIT is not an approved commit ($APPROVAL_WHY; allowlist $APPROVED)"; a3_log "stage-a refuse reason=commit-not-approved why=$APPROVAL_WHY head=$HEAD_COMMIT"; exit 8; }
 fi
 if [ "$TEST" = 1 ] && python3 -c 'import json,sys; sys.exit(0 if any(not h.endswith(".test") for h in json.load(open(sys.argv[1]))["allow"]) else 1)' "$POLICY"; then
@@ -54,6 +38,25 @@ if [ "$TEST" = 1 ] && python3 -c 'import json,sys; sys.exit(0 if any(not h.endsw
 if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then echo "refused: evidence dir $OUT is not empty"; exit 6; fi
 for img in rove-browser-pilot:local node:24-bookworm-slim; do docker image inspect $img >/dev/null 2>&1 || { echo "STOP: $img not present; not pulling"; exit 4; }; done
 umask 077; mkdir -p -m 700 "$OUT" "$OUT/proxy" "$OUT/browser"; chmod 700 "$OUT" "$OUT/proxy" "$OUT/browser"
+# R5-4: containers never mount the live worktree. Production extracts `git archive HEAD` (the approved, checked commit)
+# into a private read-only snapshot after the checks; test mode copies the tracked + untracked (non-ignored) working
+# files (so uncommitted test edits still run) unless STAGE_A_TEST_SNAPSHOT=git-archive. node_modules stays a live
+# read-only mount (outside git); its .package-lock.json sha256 is recorded.
+SNAP=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-snap-$$.XXXXXX") || { echo "STOP: snapshot dir"; exit 5; }
+if [ "$TEST" != 1 ] || [ "${STAGE_A_TEST_SNAPSHOT:-}" = git-archive ]; then
+  git -C "$WT" archive --format=tar HEAD | tar -x -C "$SNAP" && SNAPKIND="git-archive:$HEAD_COMMIT"
+else
+  (cd "$WT" && git ls-files -z -co --exclude-standard -- . ':(exclude)node_modules' | tar -c --null -T - -f -) | tar -x -C "$SNAP" && SNAPKIND="worktree-copy"
+fi
+[ -n "${SNAPKIND:-}" ] && [ -f "$SNAP/harness/stage-a-runner/run.sh" ] || { echo "STOP: snapshot failed"; chmod -R u+w "$SNAP"; rm -rf "$SNAP"; exit 5; }
+RWT=$SNAP; RSELF=$SNAP/harness/stage-a-runner
+if [ "$TEST" != 1 ]; then RPOLICY=$RSELF/policy.json
+  [ "$(shasum -a 256 "$RPOLICY" | cut -d' ' -f1)" = "$PINNED" ] || { echo "refused: snapshot policy differs from pin"; chmod -R u+w "$SNAP"; rm -rf "$SNAP"; exit 8; }
+else RPOLICY=$POLICY; fi
+chmod -R a-w "$SNAP"
+rmsnap() { [ -n "${SNAP:-}" ] && [ -d "$SNAP" ] && { chmod -R u+w "$SNAP"; rm -rf "$SNAP"; }; }   # our own private snapshot only
+trap rmsnap EXIT
+NM_LOCK_SHA=$( [ -f "$NM/.package-lock.json" ] && shasum -a 256 "$NM/.package-lock.json" | cut -d' ' -f1 || print none)
 ID=$(date +%Y%m%d%H%M%S)-$$; F=rove-a3-${ID}1; P=rove-a3-${ID}2; B=rove-a3-${ID}3; NONCE=$(a3_nonce); VOL=rove-a3-sock-$ID; SVOL=rove-a3-scratch-$ID
 START=$(date +%s)
 a3_protect $$
@@ -94,19 +97,19 @@ H=rove-a3-${ID}4
 COMMON=(--rm --pull never --label rove.a3=1 --label rove.a3.nonce=$NONCE --label rove.a3.sup=$SUP --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,size=64m --user "$(id -u):$(id -g)")
 start() { local reg=$1; shift; dcmd run -d $COMMON --name $reg "$@" >/dev/null && a3_register_container $reg $reg $NONCE; }
 # Scratch holder/copier (trusted): keeps the tmpfs scratch mounted after the browser exits, then copies out.
-start $H --network none --cpus 0.5 --memory 256m --pids-limit 32 -v $SVOL:/s:ro -v $OUT/browser:/out -v $SELF/copyout.mjs:/copyout.mjs:ro \
+start $H --network none --cpus 0.5 --memory 256m --pids-limit 32 -v $SVOL:/s:ro -v $OUT/browser:/out -v $RSELF/copyout.mjs:/copyout.mjs:ro \
   node:24-bookworm-slim sleep 86400 || { slog "holder failed"; cleanup; exit 5; }
 start $P --network none --cpus 0.5 --memory 256m --pids-limit 64 -e OUT=/evidence -e TOPLEVEL="$URLS" \
-  -v $WT:/app:ro -v $POLICY:/cfg/policy.json:ro -v $OUT/proxy:/evidence -v $VOL:/sock \
+  -v $RWT:/app:ro -v $RPOLICY:/cfg/policy.json:ro -v $OUT/proxy:/evidence -v $VOL:/sock \
   node:24-bookworm-slim node --experimental-strip-types /app/harness/stage-a-runner/proxy.ts || { slog "proxy failed"; cleanup; exit 5; }
 start $F --network container:$P --cpus 0.5 --memory 128m --pids-limit 64 \
-  -v $SELF/fixture.mjs:/fixture.mjs:ro node:24-bookworm-slim node /fixture.mjs || { slog "fixture failed"; cleanup; exit 5; }
+  -v $RSELF/fixture.mjs:/fixture.mjs:ro node:24-bookworm-slim node /fixture.mjs || { slog "fixture failed"; cleanup; exit 5; }
 for i in {1..50}; do grep -q listening <(docker logs $P 2>&1) && grep -q listening <(docker logs $F 2>&1) && break; sleep 0.1; done
 JOB="node /runner/browse.mjs"
 if [ "$TEST" = 1 ] && [ -n "${CMD:-}" ]; then JOB=$CMD; slog "TEST MODE: CMD hook in use"; fi
 start $B --network none --cpus 1 --memory 1g --memory-swap 1g --pids-limit 256 --shm-size 256m \
   -e HOME=/tmp -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright -e URLS="$URLS" -e PROBE="${PROBE:-}" \
-  -v $SELF:/runner:ro -v $NM:/node_modules:ro -v $OUT:/evidence:ro -v $SVOL:/scratch -v $VOL:/sock \
+  -v $RSELF:/runner:ro -v $NM:/node_modules:ro -v $OUT:/evidence:ro -v $SVOL:/scratch -v $VOL:/sock \
   rove-browser-pilot:local sh -c "umask 077; $JOB" || { slog "browser failed"; cleanup; exit 5; }
 for n in $B $P $F; do docker inspect $n --format "$n {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.AutoRemove}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.NetworkMode}} {{json .HostConfig.CapDrop}} {{.HostConfig.Privileged}}" 2>/dev/null; done > "$OUT/containers.inspect"
 grep "^$B " "$OUT/containers.inspect" | cut -d' ' -f2-7 > "$OUT/browser.inspect"
@@ -149,7 +152,7 @@ docker volume rm $SVOL >/dev/null 2>&1
 left=$(docker ps -aq --filter label=rove.a3.nonce=$NONCE | wc -l | tr -d ' ')
 export SELF OUT
 summary() { # <integrity: pending|true|false> <detail>
-SELF=$SELF python3 - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" <<'PY'
+SELF=$RSELF python3 - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" "$SNAPKIND" "$NM_LOCK_SHA" <<'PY'
 import json, sys, os, subprocess
 out, result, peak, left, start, test, psha, pinned, blob, integ, detail, headok, commit = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == '1', sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12] == '1', sys.argv[13]
 pd = os.path.join(out, 'proxy')
@@ -176,7 +179,7 @@ if test: result += '-TEST'
 s = {"result": result, "test_mode": test, "evidence_integrity": {"pending": None, "true": True, "false": False}[integ], "integrity_detail": detail,
      "integrity_checked_after_seal": integ != 'pending', "journal_ok": jok, "scratch_refused": refused, "scratch_copied": len(copy.get('copied', [])),
      "policy_sha256": psha, "policy_pinned_sha256": pinned, "policy_pinned_ok": psha == pinned, "policy_git_blob": blob, "policy_matches_head": headok, "head_commit": commit,
-     "commit_approved": sys.argv[14] == '1', "approval_reason": sys.argv[18], "approved_commits_file": sys.argv[15], "approved_commits_sha256": sys.argv[16], "tree_clean": sys.argv[17] == '1',
+     "commit_approved": sys.argv[14] == '1', "approval_reason": sys.argv[18], "approved_commits_file": sys.argv[15], "approved_commits_sha256": sys.argv[16], "tree_clean": sys.argv[17] == '1', "run_snapshot": sys.argv[19], "node_modules_lock_sha256": sys.argv[20],
      "peak_memory_bytes": peak, "containers_left": left, "start_epoch": start, "blocks": pol.get("blocks", {}), "a_class_total": pol.get("aTotal", 0)}
 p = os.path.join(out, 'summary.json')
 if os.path.lexists(p): os.chmod(p, 0o600); os.unlink(p)
@@ -186,7 +189,7 @@ PY
 }
 seal() {
   (cd "$OUT" && find . -type f ! -name SHA256SUMS ! -name MANIFEST.sealed -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS)
-  python3 $SELF/verify-evidence.py --seal "$OUT" $NONCE
+  python3 $RSELF/verify-evidence.py --seal "$OUT" $NONCE
 }
 result=$(summary pending "")
 slog "provisional result=$result (before integrity verification) peak_memory_bytes=$peak containers_left=$left"
@@ -196,11 +199,11 @@ if [ "$TEST" = 1 ] && [ -n "${STAGE_A_TEST_BREAK_SEAL:-}" ]; then mkfifo "$OUT/s
 # Seal, then compute evidence_integrity FROM THE VERIFIER (R3-3), then seal again over the final summary and re-verify.
 SEALOUT=$(seal); SEALRC=$?
 if [ $SEALRC -ne 0 ]; then INTEG=false; DETAIL="seal-failed: $SEALOUT"
-else V1=$(python3 $SELF/verify-evidence.py "$OUT"); [ "$V1" = intact ] && { INTEG=true; DETAIL=""; } || { INTEG=false; DETAIL="$V1"; }; fi
+else V1=$(python3 $RSELF/verify-evidence.py "$OUT"); [ "$V1" = intact ] && { INTEG=true; DETAIL=""; } || { INTEG=false; DETAIL="$V1"; }; fi
 result=$(summary $INTEG "$DETAIL")
 slog "final result=$result evidence_integrity=$INTEG (post-seal verification)"   # R4-1: authoritative line, sealed by the reseal below
 if [ $SEALRC -eq 0 ]; then chmod 600 "$OUT/MANIFEST.sealed"; seal >/dev/null || { INTEG=false; result="evidence-integrity-failure (reseal)"; }; fi
-V2=$(python3 $SELF/verify-evidence.py "$OUT" 2>&1)
+V2=$(python3 $RSELF/verify-evidence.py "$OUT" 2>&1)
 echo "evidence: $V2 (integrity=$INTEG)"
 [ "$INTEG" = true ] && [ "$V2" = intact ] || exit 10
 [[ $result == completed* ]] && exit 0 || exit 9
