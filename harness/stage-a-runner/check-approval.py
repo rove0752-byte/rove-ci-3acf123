@@ -16,7 +16,7 @@ def check(head, wt, path):
     rp, wtr = os.path.realpath(path), os.path.realpath(wt)
     if rp == wtr or rp.startswith(wtr + os.sep): return out(0, 'allowlist-inside-repo')
     # R5-3: refuse if the file's real directory is inside ANY git worktree / repo / .git dir (e.g. ~/rove, ~/rove-wt/*).
-    g = subprocess.run(['git', '-C', os.path.dirname(rp), 'rev-parse', '--git-dir'], capture_output=True, text=True,
+    g = subprocess.run([os.environ.get('A3_GIT', 'git'), '-C', os.path.dirname(rp), 'rev-parse', '--git-dir'], capture_output=True, text=True,
                        env={**os.environ, 'GIT_CEILING_DIRECTORIES': ''})
     if g.returncode == 0: return out(0, 'allowlist-inside-git')
     if st.st_uid != os.getuid() or st.st_mode & 0o022: return out(0, 'allowlist-bad-owner-or-mode')

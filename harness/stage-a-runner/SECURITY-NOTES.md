@@ -82,3 +82,20 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
   - run.sh and registry.sh/kill.sh still run from the live tree. The PATH lookups for python3, git, docker and shasum are trusted.
   - node_modules isn't integrity-checked; only its lockfile hash is recorded.
 - Private git homes are named `rove-a3-ghome-<pid>-<lstart>.*` and, like snapshots, are swept at the next start after a SIGKILL.
+
+## Round 7 changes (builder claims, pending independent review)
+- R7-1: GIT_NO_REPLACE_OBJECTS=1 is exported, and every git call passes `--no-replace-objects`, including those inside verify-snapshot.py and check-approval.py.
+  - Production refuses if any `refs/replace/*` ref exists, or if `info/grafts`, `objects/info/alternates` or `shallow` exists in the common git dir.
+  - verify-snapshot.py no longer trusts `ls-tree`. It reads raw objects through `cat-file --batch` and re-hashes the commit and every tree object itself, so a substituted or corrupted object file is detected. Blobs are compared by recomputing their ids from the snapshot's bytes.
+- R7-2: run.sh pins `PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`.
+  - python3 and git are resolved from a fixed list (/usr/bin, then /opt/homebrew/bin, then /usr/local/bin), and Python runs with `-I`.
+  - In production, registry.sh, check-approval.py and verify-snapshot.py are extracted from HEAD, after the replace/graft refusal, and sourced or run from the private git home.
+  - A PATH python3 shim with sitecustomize (the round-6 harness) is now provably ignored (test R7-2).
+- R7-2 harness for the R6-2 end-to-end test: in a throwaway clone, the test commits a one-line change to check-approval.py's DEFAULT that points at a fake home, and approves that clone commit in a fake allowlist.
+  - It asserts that the commit differs from the reviewed code by exactly that one line, and that the real allowlist is unchanged and empty.
+- R7-3: sweep log lines now say `sweep stale snap …` or `sweep stale ghome …`.
+- **R7-4 (residual, newly documented): the approval anchor lives in the repo.** check-approval.py (with its DEFAULT path) and run.sh come from the commit being checked. So a candidate commit that rewrites its own checker or allowlist root can approve itself.
+  - The R6-2 harness shows exactly this. The approval gate protects against running *unreviewed content under a reviewed launcher*, not against a hostile launcher.
+  - Compensating controls: the operator must launch a reviewed run.sh, recorded via head_commit and run_snapshot. The real allowlist is empty.
+  - Proposed fix (needs a decision): a trusted launcher and checker installed OUTSIDE the repo with a recorded hash, which reads the fixed allowlist and treats the repo only as data.
+- Still trusted: /usr/local/bin and /opt/homebrew/bin (user-writable on some Macs) for docker, plus node_modules (lockfile hash only).

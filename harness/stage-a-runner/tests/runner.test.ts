@@ -437,8 +437,8 @@ test('R3-6: a SIGKILLed supervisor leaves resources that the next start sweeps',
   assert.notEqual(q('ps') + q('volume'), '', 'SIGKILL leaves something behind (precondition)');
   const r = run('after-kill', 30, ['http://allowed.test/a']);
   assert.match(r.read('supervisor.log') + readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale/);
-  assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale snapshot .*rove-a3-snap-/, 'R5-4: killed run snapshot swept');
-  assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale snapshot .*rove-a3-ghome-/, 'R6-1: killed run private git home swept');
+  assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale snap .*rove-a3-snap-/, 'R5-4: killed run snapshot swept');
+  assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale ghome .*rove-a3-ghome-/, 'R6-1: killed run private git home swept');
   assert.equal(q('ps'), ''); assert.equal(q('volume'), '');
 });
 test('R3-7: policy.json + policy.sha256 edited together (uncommitted) are refused outside test mode', { timeout: 60_000 }, () => {
@@ -589,28 +589,34 @@ test('R4-4: copy-out is aborted and the run fails if the browser container is st
 });
 
 // ---- Round 6 ----
-// R6-2 harness: an isolated production run. Production deliberately ignores every allowlist override (R5-2), so the test
-// gives run.sh a fake *passwd* home: a python3 shim, first on PATH and only inside this test's temp dir, loads a
-// sitecustomize that makes pwd.getpwuid() return that fake home. Everything else is the unmodified production path
-// (no STAGE_A_TEST, no hooks) on a throwaway clone with local fixtures only (all containers --network none).
-// It cannot enable real production: the real APPROVED-COMMITS.txt is never read or written (asserted unchanged and
-// empty), the shim exists only in a temp dir for this process tree, and planting a python3 earlier on PATH already
-// requires same-user code execution (documented trust boundary).
+// R6-2/R7-2 harness: an isolated production run. Production ignores every allowlist override (R5-2) and, since R7-2,
+// also the caller's PATH and PYTHON* environment, so the only way to point it at a throwaway allowlist is to change the
+// code under test: in a THROWAWAY CLONE the test commits a one-line change to check-approval.py's DEFAULT (allowlist
+// root -> a fake home in a temp dir) and lists that clone commit in the fake allowlist. Everything else is the
+// unmodified production path (no STAGE_A_TEST, no hooks) with local fixtures only (all containers --network none).
+// Why this cannot enable real production: the change exists only in a temp clone that is deleted afterwards; the real
+// APPROVED-COMMITS.txt is never read or written (asserted unchanged and empty); and the commit is asserted to differ
+// from the code under review by exactly that one line. (A commit that redefines its own allowlist root is the
+// "approval anchor lives in the repo" residual risk R7-4 recorded in SECURITY-NOTES: the operator must launch a
+// trusted, reviewed run.sh; approval cannot protect against a hostile launcher.)
 const realAllow = join(spawnSync('python3', ['-c', 'import pwd,os;print(pwd.getpwuid(os.getuid()).pw_dir)'], { encoding: 'utf8' }).stdout.trim(), 'rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt');
 const fileSha = (f: string) => existsSync(f) ? spawnSync('shasum', ['-a', '256', f], { encoding: 'utf8' }).stdout.split(' ')[0] : 'absent';
 const prodHarness = () => {
   const { d, g, head } = scratchClone();
   const nmLive = join(dirname(dirname(here)), 'node_modules');
   spawnSync('ln', ['-s', spawnSync('readlink', [nmLive], { encoding: 'utf8' }).stdout.trim() || nmLive, join(d, 'node_modules')]);
-  const h = mkdtempSync(join(tmpdir(), 'r62-')), fake = join(h, 'home'), shim = join(h, 'shim');
-  mkdirSync(join(fake, 'rove-recovery-evidence/stage-a-runner'), { recursive: true }); mkdirSync(shim);
+  const h = mkdtempSync(join(tmpdir(), 'r62-')), fake = join(h, 'home');
+  mkdirSync(join(fake, 'rove-recovery-evidence/stage-a-runner'), { recursive: true });
+  const reviewed = head(), ca = join(d, 'harness/stage-a-runner/check-approval.py');
+  const src = readFileSync(ca, 'utf8'), line = src.split('\n').find(l => l.startsWith('DEFAULT = '))!;
+  writeFileSync(ca, src.replace(line, `DEFAULT = os.path.join(${JSON.stringify(fake)}, 'rove-recovery-evidence', 'stage-a-runner', 'APPROVED-COMMITS.txt')  # TEST-ONLY throwaway clone`));
+  g('commit', '-qam', 'TEST-ONLY: allowlist root -> fake home (throwaway clone)');
+  const diff = g('diff', '--numstat', reviewed, 'HEAD').stdout.trim();
+  assert.equal(diff, '1\t1\tharness/stage-a-runner/check-approval.py', 'test commit differs from reviewed code by exactly one line');
   writeFileSync(join(fake, 'rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt'), `${head()} r62-test-only\n`, { mode: 0o600 });
-  const realPy = spawnSync('python3', ['-c', 'import sys;print(sys.executable)'], { encoding: 'utf8' }).stdout.trim();
-  writeFileSync(join(shim, 'sitecustomize.py'), `import os, pwd\n_r = pwd.getpwuid\ndef getpwuid(uid):\n    p = _r(uid)\n    return pwd.struct_passwd((p.pw_name, p.pw_passwd, p.pw_uid, p.pw_gid, p.pw_gecos, ${JSON.stringify(fake)}, p.pw_shell)) if uid == os.getuid() else p\npwd.getpwuid = getpwuid\n`);
-  writeFileSync(join(shim, 'python3'), `#!/bin/sh\nPYTHONPATH=${JSON.stringify(shim)} exec ${JSON.stringify(realPy)} "$@"\n`, { mode: 0o700 });
   const go = (extra: Record<string, string> = {}, urls = ['http://allowed.test/a']) => {
     const out = join(mkdtempSync(join(root, 'r62run-')), 'ev');
-    const r = spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), out, '40', ...urls], { env: { ...env, ...PROD, PATH: `${shim}:${process.env.PATH}`, ...extra }, encoding: 'utf8' });
+    const r = spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), out, '40', ...urls], { env: { ...env, ...PROD, ...extra }, encoding: 'utf8' });
     return { ...r, out, summary: existsSync(join(out, 'summary.json')) ? JSON.parse(readFileSync(join(out, 'summary.json'), 'utf8')) : {} };
   };
   return { d, g, head, fake, go, done: () => { rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); } };
@@ -667,4 +673,69 @@ test('R6-1: caller-injected git env (GIT_CONFIG_COUNT attributes+smudge, GIT_DIR
       GIT_DIR: join(h, 'bogus'), GIT_INDEX_FILE: join(h, 'bogus-index'), GIT_CEILING_DIRECTORIES: '/' });
     assert.equal(r.status, 0, r.stdout + r.stderr); assert.match(r.summary.snapshot_verified, /^ok /); assert.equal(r.summary.run_snapshot, `git-archive:${H.head()}`);
   } finally { H.done(); rmSync(h, { recursive: true, force: true }); }
+});
+
+// ---- Round 7 ----
+test('R7-1: the reviewer\'s replace-ref attack (approved id, replaced content) is refused in production', opts, () => {
+  const H = prodHarness();
+  try {
+    const approved = H.head(), fx = join(H.d, 'harness/stage-a-runner/fixture.mjs');
+    H.g('checkout', '-q', '-b', 'rv-evil');
+    writeFileSync(fx, readFileSync(fx, 'utf8').replace('Page A', 'RV-REPLACED')); H.g('commit', '-qam', 'unreviewed');
+    const evil = H.head(); H.g('checkout', '-q', '-'); H.g('replace', approved, evil); H.g('reset', '-q', '--hard');
+    assert.equal(H.g('rev-parse', 'HEAD').stdout.trim(), approved, 'HEAD id is still the approved one (precondition)');
+    assert.match(readFileSync(fx, 'utf8'), /RV-REPLACED/, 'worktree carries the replaced content (precondition)');
+    let r = H.go(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /replace refs.*refs\/replace\//);
+    // defence in depth: even if the refusal were bypassed, verify-snapshot (no-replace, re-hashed objects) rejects a
+    // snapshot produced by a replace-honouring `git archive`.
+    const snap = mkdtempSync(join(tmpdir(), 'r71snap-'));
+    try {
+      spawnSync('sh', ['-c', `git -C "${H.d}" archive HEAD | tar -x -C "${snap}"`]);
+      assert.match(readFileSync(join(snap, 'harness/stage-a-runner/fixture.mjs'), 'utf8'), /RV-REPLACED/);
+      const v = spawnSync('python3', [join(here, 'verify-snapshot.py'), H.d, approved, snap], { encoding: 'utf8' });
+      assert.equal(v.status, 1); assert.match(v.stdout, /mismatch content harness\/stage-a-runner\/fixture\.mjs/);
+    } finally { rmSync(snap, { recursive: true, force: true }); }
+    H.g('replace', '-d', approved); H.g('reset', '-q', '--hard');
+    r = H.go(); assert.equal(r.status, 0, r.stdout); assert.ok(!readFileSync(join(r.out, 'browser/browse.json'), 'utf8').includes('RV-REPLACED'));
+  } finally { H.done(); }
+});
+test('R7-1: grafts, alternates and shallow files in the common git dir are refused in production', { timeout: 60_000 }, () => {
+  const H = prodHarness();
+  try {
+    for (const f of ['info/grafts', 'objects/info/alternates', 'shallow']) {
+      const p = join(H.d, '.git', f); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, '\n');
+      const r = H.go(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, new RegExp(`replace refs / grafts / alternates / shallow present: .*${f.replace(/\//g, '\\/')}`));
+      rmSync(p);
+    }
+  } finally { H.done(); }
+});
+test('R7-1: verify-snapshot re-hashes objects (a substituted loose tree object is detected)', { timeout: 60_000 }, () => {
+  const { d, g, head } = scratchClone(); const snap = mkdtempSync(join(tmpdir(), 'r71obj-'));
+  try {
+    const c = head(); spawnSync('sh', ['-c', `git -C "${d}" archive HEAD | tar -x -C "${snap}"`]);
+    assert.match(spawnSync('python3', [join(here, 'verify-snapshot.py'), d, c, snap], { encoding: 'utf8' }).stdout, /^ok \d+/);
+    // swap the loose object file of HEAD's root tree for another tree's object file (same id, different content)
+    const tree = g('rev-parse', 'HEAD^{tree}').stdout.trim(), other = g('rev-parse', 'HEAD:harness').stdout.trim();
+    // the snapshot commit's root tree and harness/ tree are fresh LOOSE objects in the clone
+    const [rp, op] = [tree, other].map(t => join(d, '.git/objects', t.slice(0, 2), t.slice(2)));
+    assert.ok(existsSync(rp) && existsSync(op), 'both trees are loose objects (precondition)');
+    chmodSync(rp, 0o600); writeFileSync(rp, readFileSync(op));
+    const v = spawnSync('python3', [join(here, 'verify-snapshot.py'), d, c, snap], { encoding: 'utf8' });
+    assert.equal(v.status, 1); assert.match(v.stdout, /mismatch (tree-hash|object-tree)/);
+  } finally { rmSync(d, { recursive: true, force: true }); rmSync(snap, { recursive: true, force: true }); }
+});
+test('R7-2: production ignores the caller\'s PATH and PYTHON* (a PATH python3 shim faking pwd is never used)', { timeout: 60_000 }, () => {
+  const { d, head } = scratchClone(); const h = mkdtempSync(join(tmpdir(), 'r72-'));
+  try {
+    const fake = join(h, 'home'); mkdirSync(join(fake, 'rove-recovery-evidence/stage-a-runner'), { recursive: true });
+    writeFileSync(join(fake, 'rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt'), `${head()} shim\n`, { mode: 0o600 });
+    const shim = join(h, 'shim'); mkdirSync(shim); const marker = join(h, 'shim-used');
+    writeFileSync(join(shim, 'sitecustomize.py'), `import os, pwd\nopen(${JSON.stringify(marker)}, 'a').close()\n_r = pwd.getpwuid\ndef getpwuid(uid):\n    p = _r(uid)\n    return pwd.struct_passwd((p.pw_name, p.pw_passwd, p.pw_uid, p.pw_gid, p.pw_gecos, ${JSON.stringify(fake)}, p.pw_shell)) if uid == os.getuid() else p\npwd.getpwuid = getpwuid\n`);
+    const realPy = spawnSync('python3', ['-c', 'import sys;print(sys.executable)'], { encoding: 'utf8' }).stdout.trim();
+    writeFileSync(join(shim, 'python3'), `#!/bin/sh\nPYTHONPATH=${JSON.stringify(shim)} exec ${JSON.stringify(realPy)} "$@"\n`, { mode: 0o700 });
+    writeFileSync(join(shim, 'git'), '#!/bin/sh\necho shim-git >&2; exit 1\n', { mode: 0o700 });
+    const r = prodRun(d, { PATH: `${shim}:${process.env.PATH}`, PYTHONPATH: shim });
+    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /head-not-approved; allowlist .*rove-recovery-evidence\/stage-a-runner\/APPROVED-COMMITS\.txt\)/);
+    assert.ok(!r.stdout.includes(fake)); assert.equal(existsSync(marker), false, 'shim python never ran');
+  } finally { rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); }
 });
