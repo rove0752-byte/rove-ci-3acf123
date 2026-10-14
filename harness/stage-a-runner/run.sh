@@ -7,7 +7,7 @@
 # only writable mount), $OUT/* (supervisor). The browser sees $OUT read-only.
 # usage: run.sh <new-evidence-dir> <wall-seconds> <url...>
 set -u
-SELF=${0:A:h}; WT=${SELF:h:h}
+SELF=${0:A:h}; WT=${A3_REPO:-${SELF:h:h}}; WT=${WT:A}   # launcher passes the repo; run.sh itself runs from its snapshot
 # R7-2: fixed system PATH and absolute tools; the caller's PATH is never used. /usr/local/bin is needed for Docker
 # Desktop's CLI; py and git are resolved ONLY from /usr/bin, then Homebrew/usr-local, in that fixed order.
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
@@ -18,11 +18,16 @@ py() { $PY -I "$@"; }   # -I: isolated mode (ignores PYTHON* env and the user si
 # R6-1/R7-1: git runs with a sanitised environment: no caller GIT_* / PYTHON* variables, no system/global config, a
 # private empty HOME, hooks / attributesFile / fsmonitor disabled, and REPLACE OBJECTS IGNORED (R7-1). Repo-local
 # config (filters, .git/info/attributes) cannot be fully disabled, so the snapshot is ALSO verified object-by-object.
-unset -m 'GIT_*'; unset -m 'PYTHON*'
+unset -m 'GIT_*'; unset -m 'PYTHON*'; unset DEVELOPER_DIR SDKROOT; unset -m 'DOCKER_*'   # R8-1: toolchain + daemon not caller-selectable
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 A3_GIT=$GITBIN
 SUP="$$-$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//' | tr -cd '0-9A-Za-z')"   # same form as a3_lstart (registry.sh)
 GHOME=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-ghome-$SUP.XXXXXX") || exit 5
 trap 'rm -rf "$GHOME"' EXIT
+# R8-1: pin the docker daemon to this user's Docker Desktop socket (else the system socket) with an empty client config.
+PWHOME=$($PY -I -c 'import os,pwd;print(pwd.getpwuid(os.getuid()).pw_dir)')
+DSOCK=$PWHOME/.docker/run/docker.sock; [ -S "$DSOCK" ] || DSOCK=/var/run/docker.sock
+export DOCKER_HOST=unix://$DSOCK DOCKER_CONFIG=$GHOME/docker; mkdir -p -m 700 "$DOCKER_CONFIG"
+TOOLCHAIN=$(/usr/bin/xcode-select -p 2>/dev/null || print none)
 git() { HOME=$GHOME XDG_CONFIG_HOME=$GHOME $GITBIN --no-replace-objects -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false "$@"; }
 TEST=${STAGE_A_TEST:-0}
 # R7-1: history-rewriting object sources are refused in production (and recorded in every mode).
@@ -67,6 +72,17 @@ fi
 if [ "$TEST" = 1 ] && py -c 'import json,sys; sys.exit(0 if any(not h.endswith(".test") for h in json.load(open(sys.argv[1]))["allow"]) else 1)' "$POLICY"; then
   echo "refused: test mode with non-.test hosts in the allowlist"; exit 7; fi
 if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then echo "refused: evidence dir $OUT is not empty"; exit 6; fi
+# R7-4: production runs ONLY when started by an approved trusted launcher, from the launcher's verified snapshot.
+LA=("${(@f)$(HOME=$GHOME $PY -I "$TRUSTED/check-approval.py" --launcher-dir "${A3_LAUNCHER_DIR:-/nonexistent}")}")
+L_OK=${LA[1]:-0}; L_SHA=${LA[2]:--}; L_WHY=${LA[3]:-check-failed}
+if [ "$TEST" != 1 ]; then
+  [ -n "${A3_LAUNCHER_DIR:-}" ] || { echo "refused: production must be started via the trusted launcher (a3-launch)"; a3_log "stage-a refuse reason=not-launched"; exit 8; }
+  [[ ${SELF:A} != ${WT:A}/* ]] || { echo "refused: run.sh must run from the launcher's snapshot, not the live tree"; exit 8; }
+  [ "$L_OK" = 1 ] || { echo "refused: launcher not approved ($L_WHY; manifest $L_SHA; list ${LA[4]:-?})"; a3_log "stage-a refuse reason=launcher-not-approved"; exit 8; }
+fi
+DOCKER_SERVER_ID=$(docker info --format '{{.ID}}' 2>/dev/null || print unknown)
+IMAGE_IDS=""
+for img in rove-browser-pilot:local node:24-bookworm-slim; do IMAGE_IDS+="$img=$(docker image inspect -f '{{.Id}}' $img 2>/dev/null) "; done
 for img in rove-browser-pilot:local node:24-bookworm-slim; do docker image inspect $img >/dev/null 2>&1 || { echo "STOP: $img not present; not pulling"; exit 4; }; done
 umask 077; mkdir -p -m 700 "$OUT" "$OUT/proxy" "$OUT/browser"; chmod 700 "$OUT" "$OUT/proxy" "$OUT/browser"
 # R5-4: containers never mount the live worktree. Production extracts `git archive HEAD` (the approved, checked commit)
@@ -79,7 +95,7 @@ if [ "$TEST" != 1 ] || [ "${STAGE_A_TEST_SNAPSHOT:-}" = git-archive ]; then
 else
   (cd "$WT" && git ls-files -z -co --exclude-standard -- . ':(exclude)node_modules' | tar -c --null -T - -f -) | tar -x -C "$SNAP" && SNAPKIND="worktree-copy"
 fi
-[ -n "${SNAPKIND:-}" ] && [ -f "$SNAP/harness/stage-a-runner/run.sh" ] || { echo "STOP: snapshot failed"; chmod -R u+w "$SNAP"; rm -rf "$SNAP"; exit 5; }
+[ -n "${SNAPKIND:-}" ] && [ -f "$SNAP/harness/stage-a-runner/run.sh" ] || { echo "refused: snapshot extraction failed (possible object tampering)"; chmod -R u+w "$SNAP"; rm -rf "$SNAP"; exit 8; }
 SNAP_VERIFIED=not-applicable
 if [[ $SNAPKIND == git-archive:* ]]; then   # R6-1: every snapshot file must equal its blob in HEAD's tree
   SV=$(HOME=$GHOME $PY -I "$TRUSTED/verify-snapshot.py" "$WT" "$HEAD_COMMIT" "$SNAP" 2>&1) && SNAP_VERIFIED="$SV" || {
@@ -196,7 +212,7 @@ docker volume rm $SVOL >/dev/null 2>&1
 left=$(docker ps -aq --filter label=rove.a3.nonce=$NONCE | wc -l | tr -d ' ')
 export SELF OUT
 summary() { # <integrity: pending|true|false> <detail>
-SELF=$RSELF py - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" "$SNAPKIND" "$NM_LOCK_SHA" "$SNAP_VERIFIED" "$SNAP_POLICY_SHA" <<'PY'
+SELF=$RSELF py - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" "$SNAPKIND" "$NM_LOCK_SHA" "$SNAP_VERIFIED" "$SNAP_POLICY_SHA" "${A3_LAUNCHER_DIR:-}" "$L_SHA" "$L_OK" "$L_WHY" "$DOCKER_HOST" "$DOCKER_SERVER_ID" "$IMAGE_IDS" "$TOOLCHAIN" <<'PY'
 import json, sys, os, subprocess
 out, result, peak, left, start, test, psha, pinned, blob, integ, detail, headok, commit = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == '1', sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12] == '1', sys.argv[13]
 pd = os.path.join(out, 'proxy')
@@ -224,6 +240,8 @@ s = {"result": result, "test_mode": test, "evidence_integrity": {"pending": None
      "integrity_checked_after_seal": integ != 'pending', "journal_ok": jok, "scratch_refused": refused, "scratch_copied": len(copy.get('copied', [])),
      "policy_sha256": psha, "policy_pinned_sha256": pinned, "policy_pinned_ok": psha == pinned, "policy_git_blob": blob, "policy_matches_head": headok, "head_commit": commit,
      "commit_approved": sys.argv[14] == '1', "approval_reason": sys.argv[18], "approved_commits_file": sys.argv[15], "approved_commits_sha256": sys.argv[16], "tree_clean": sys.argv[17] == '1', "run_snapshot": sys.argv[19], "node_modules_lock_sha256": sys.argv[20], "snapshot_verified": sys.argv[21], "snapshot_policy_sha256": sys.argv[22],
+     "launcher_dir": sys.argv[23], "launcher_sha256": sys.argv[24], "launcher_approved": sys.argv[25] == '1', "launcher_reason": sys.argv[26],
+     "docker_host": sys.argv[27], "docker_server_id": sys.argv[28], "image_ids": dict(x.split('=', 1) for x in sys.argv[29].split()), "toolchain": sys.argv[30],
      "peak_memory_bytes": peak, "containers_left": left, "start_epoch": start, "blocks": pol.get("blocks", {}), "a_class_total": pol.get("aTotal", 0)}
 p = os.path.join(out, 'summary.json')
 if os.path.lexists(p): os.chmod(p, 0o600); os.unlink(p)

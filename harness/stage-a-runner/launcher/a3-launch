@@ -1,0 +1,48 @@
+#!/bin/zsh -f
+# Stage A trusted external launcher (R7-4). Installed OUTSIDE every repo, read-only, by launcher/install.sh; its
+# manifest hash must be listed in APPROVED-LAUNCHERS.txt (Jacko) for production to run.
+# It treats the repo as DATA: verifies the commit (no replace/grafts/alternates/shallow, no hidden index flags, clean
+# tree, HEAD in the commit allowlist), extracts `git archive HEAD`, verifies it object-by-object with ITS OWN installed
+# verify-snapshot.py, then runs the SNAPSHOT's run.sh (never the live one) in a scrubbed environment.
+# usage: a3-launch <repo> <new-evidence-dir> <wall-seconds> <url...>      Refusals: exit 8 ("refused: ...").
+if [ -z "${A3_LAUNCH_CLEAN:-}" ]; then   # re-exec with an empty environment (drops GIT_*, PYTHON*, DOCKER_*, DEVELOPER_DIR, SDKROOT, ...)
+  exec /usr/bin/env -i A3_LAUNCH_CLEAN=1 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin LANG=C \
+    USER="$(/usr/bin/id -un)" TMPDIR="${TMPDIR:-/tmp}" ${A3_REGISTRY:+A3_REGISTRY=$A3_REGISTRY} ${A3_KILL_LOG:+A3_KILL_LOG=$A3_KILL_LOG} \
+    /bin/zsh -f "$0" "$@"
+fi
+set -u
+LDIR=${0:A:h}
+for c in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do [ -x $c ] && { PY=$c; break; }; done
+for c in /usr/bin/git /opt/homebrew/bin/git /usr/local/bin/git; do [ -x $c ] && { GITBIN=$c; break; }; done
+[ -n "${PY:-}" ] && [ -n "${GITBIN:-}" ] || { echo "refused: python3/git not found in fixed system locations"; exit 8; }
+export HOME=$($PY -I -c 'import os,pwd;print(pwd.getpwuid(os.getuid()).pw_dir)')
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 A3_GIT=$GITBIN
+[ $# -ge 3 ] || { echo "usage: a3-launch <repo> <new-evidence-dir> <wall-seconds> <url...>"; exit 2; }
+REPO=${1:A}; shift
+SUP="$$-$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//' | tr -cd '0-9A-Za-z')"
+GH=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-ghome-$SUP.XXXXXX") || exit 8
+SNAP=""
+done_() { [ -n "$SNAP" ] && [ -d "$SNAP" ] && { chmod -R u+w "$SNAP"; rm -rf "$SNAP"; }; rm -rf "$GH"; }
+trap done_ EXIT
+trap 'exit 130' INT TERM HUP
+g() { HOME=$GH XDG_CONFIG_HOME=$GH $GITBIN --no-replace-objects -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false -C "$REPO" "$@"; }
+refuse() { echo "refused: $*"; exit 8; }
+SELFCHK=("${(@f)$($PY -I "$LDIR/check-approval.py" --launcher-dir "$LDIR")}")
+[ "${SELFCHK[1]:-0}" = 1 ] || refuse "launcher not approved (${SELFCHK[3]:-?}; manifest ${SELFCHK[2]:--}; list ${SELFCHK[4]:-?})"
+HEAD_COMMIT=$(g rev-parse HEAD 2>/dev/null) || refuse "not a git repo: $REPO"
+GCD=$(g rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+RW=$( { g for-each-ref --format='%(refname)' refs/replace/ 2>/dev/null; for f in info/grafts objects/info/alternates shallow; do [ -e "$GCD/$f" ] && print "$GCD/$f"; done; } | head -3)
+[ -z "$RW" ] || refuse "replace refs / grafts / alternates / shallow present: ${RW//$'\n'/; }"
+HID=$(g ls-files -v 2>&1 | grep -v '^H ' | head -3)
+[ -z "$HID" ] || refuse "index has skip-worktree/assume-unchanged (or other non-H) entries: ${HID//$'\n'/; }"
+[ -z "$(g status --porcelain --untracked-files=all -- . ':(exclude)node_modules' 2>&1)" ] || refuse "working tree not clean (whole tree except node_modules; untracked counts) or no HEAD"
+AP=("${(@f)$($PY -I "$LDIR/check-approval.py" "$HEAD_COMMIT" "$REPO" "")}")
+[ "${AP[1]:-0}" = 1 ] || refuse "HEAD $HEAD_COMMIT is not an approved commit (${AP[3]:-check-failed}; allowlist ${AP[4]:-?})"
+SNAP=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-snap-$SUP.XXXXXX") || exit 8
+g archive --format=tar HEAD | tar -x -C "$SNAP" || refuse "snapshot extraction failed (possible object tampering)"
+SV=$($PY -I "$LDIR/verify-snapshot.py" "$REPO" "$HEAD_COMMIT" "$SNAP" 2>&1) || refuse "snapshot does not match HEAD tree ($SV)"
+chmod -R a-w "$SNAP"
+[ -f "$SNAP/harness/stage-a-runner/run.sh" ] || refuse "snapshot has no run.sh"
+A3_LAUNCHER_DIR=$LDIR A3_LAUNCHER_SHA256=${SELFCHK[2]} A3_REPO=$REPO A3_LAUNCH_SNAPSHOT_VERIFIED="$SV" \
+  /bin/zsh -f "$SNAP/harness/stage-a-runner/run.sh" "$@"
+exit $?

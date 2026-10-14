@@ -3,12 +3,14 @@
 usage: check-approval.py <head-commit> <worktree> [override-path]
 The override is passed by run.sh ONLY in test mode (R5-2); in production the allowlist is always the fixed default
 <passwd home>/rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt ($HOME is not trusted for this).
-Prints four lines: <0|1>, <sha256|->, <reason>, <path>."""
+       check-approval.py --launcher-dir <dir>      (R7-4: trusted external launcher)
+Prints four lines: <0|1>, <sha256|->, <reason>, <path>.
+The approved-launchers list is APPROVED-LAUNCHERS.txt next to the commit allowlist (same fixed directory)."""
 import hashlib, os, pwd, re, stat, subprocess, sys
 
 DEFAULT = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'rove-recovery-evidence', 'stage-a-runner', 'APPROVED-COMMITS.txt')
 
-def check(head, wt, path):
+def check(head, wt, path, idre=r'([0-9a-f]{40})(\s|$)'):
     def out(ok, why, sha='-'): return f"{ok}\n{sha}\n{why}\n{path}"
     try: st = os.lstat(path)
     except OSError: return out(0, 'allowlist-missing')
@@ -22,11 +24,35 @@ def check(head, wt, path):
     if st.st_uid != os.getuid() or st.st_mode & 0o022: return out(0, 'allowlist-bad-owner-or-mode')
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW); data = os.read(fd, 1 << 20); os.close(fd)
     sha = hashlib.sha256(data).hexdigest()
-    if not re.fullmatch(r'[0-9a-f]{40}', head): return out(0, 'no-head', sha)
-    ids = {m.group(1) for l in data.decode('utf-8', 'replace').splitlines() if (m := re.match(r'([0-9a-f]{40})(\s|$)', l))}
+    if not re.fullmatch(idre[1:idre.index(')')], head): return out(0, 'no-head', sha)
+    ids = {m.group(1) for l in data.decode('utf-8', 'replace').splitlines() if (m := re.match(idre, l))}
     return out(1, 'approved', sha) if head in ids else out(0, 'head-not-approved', sha)
 
+LAUNCHER_FILES = ('a3-launch', 'check-approval.py', 'verify-snapshot.py')
+
+def launcher_hash(d):
+    """Manifest hash of an installed launcher dir: sha256 over "<sha256>  <name>\n" lines of its 3 files, sorted."""
+    return hashlib.sha256(''.join(f"{hashlib.sha256(open(os.path.join(d, n), 'rb').read()).hexdigest()}  {n}\n" for n in sorted(LAUNCHER_FILES)).encode()).hexdigest()
+
+def check_launcher(d):
+    path = os.path.join(os.path.dirname(DEFAULT), 'APPROVED-LAUNCHERS.txt')
+    def out(ok, why, sha='-'): return f"{ok}\n{sha}\n{why}\n{path}"
+    try: st = os.lstat(d)
+    except OSError: return out(0, 'launcher-missing')
+    if not stat.S_ISDIR(st.st_mode): return out(0, 'launcher-not-dir')
+    if sorted(os.listdir(d)) != sorted(LAUNCHER_FILES): return out(0, 'launcher-unexpected-files')
+    for p in [d] + [os.path.join(d, n) for n in LAUNCHER_FILES]:
+        s2 = os.lstat(p)
+        if p != d and not stat.S_ISREG(s2.st_mode): return out(0, 'launcher-not-regular')
+        if s2.st_uid != os.getuid() or s2.st_mode & 0o222: return out(0, 'launcher-writable-or-foreign')
+    g = subprocess.run([os.environ.get('A3_GIT', 'git'), '-C', os.path.realpath(d), 'rev-parse', '--git-dir'], capture_output=True, text=True)
+    if g.returncode == 0: return out(0, 'launcher-inside-git')
+    sha = launcher_hash(d)
+    ok, lsha, why, _ = check(sha, '/nonexistent', path, idre=r'([0-9a-f]{64})(\s|$)').split('\n')
+    return out(int(ok), {'approved': 'launcher-approved', 'head-not-approved': 'launcher-not-approved'}.get(why, why), sha)
+
 if __name__ == '__main__':
+    if sys.argv[1] == '--launcher-dir': print(check_launcher(sys.argv[2])); sys.exit(0)
     head, wt = sys.argv[1], sys.argv[2]
     path = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else DEFAULT
     print(check(head, wt, path))

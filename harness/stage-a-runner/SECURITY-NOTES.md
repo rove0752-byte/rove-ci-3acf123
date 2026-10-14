@@ -99,3 +99,38 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
   - Compensating controls: the operator must launch a reviewed run.sh, recorded via head_commit and run_snapshot. The real allowlist is empty.
   - Proposed fix (needs a decision): a trusted launcher and checker installed OUTSIDE the repo with a recorded hash, which reads the fixed allowlist and treats the repo only as data.
 - Still trusted: /usr/local/bin and /opt/homebrew/bin (user-writable on some Macs) for docker, plus node_modules (lockfile hash only).
+
+## Round 8: trusted external launcher (R7-4) and R8-1 (builder claims, pending independent review; D-30)
+**Design**
+- The launcher bundle has 3 files from one reviewed commit: `launcher/a3-launch`, `check-approval.py` and `verify-snapshot.py`.
+- `launcher/install.sh <repo> <commit> <dest>` installs it from git objects (`cat-file`, no replace refs, never the live tree) into a NEW dir outside every git repo. Files are set to 0500/0400 and the dir to 0500.
+- install.sh prints the **manifest hash**: sha256 over the sorted `<sha256>  <name>` lines of the 3 files.
+- Approval: the manifest hash must be listed in `APPROVED-LAUNCHERS.txt`, in the same fixed, getpwuid-home directory as APPROVED-COMMITS.txt, with the same rules (regular file, not a symlink, owned by the user, not group/world-writable, outside every git repo). It is not created, so nothing is approved.
+- Every time it runs, `a3-launch <repo> <out> <wall> <urls…>`:
+  1. re-execs itself with `env -i`, keeping only a fixed PATH, USER, TMPDIR and LANG (plus A3_REGISTRY and A3_KILL_LOG). This drops GIT_*, PYTHON*, DOCKER_*, DEVELOPER_DIR and SDKROOT.
+  2. self-checks its dir: exact file set, no write bits, owned by the user, not in git, manifest hash approved. Otherwise it refuses.
+  3. treats the repo as data: no replace refs, grafts, alternates or shallow; no non-`H` index flags; whole tree clean; HEAD in APPROVED-COMMITS.
+  4. extracts `git archive HEAD`, verifies it object-by-object with **its own** verify-snapshot.py, and makes it read-only.
+  5. runs the **snapshot's** run.sh, passing A3_LAUNCHER_DIR, A3_LAUNCHER_SHA256 and A3_REPO.
+- run.sh in production also requires all of these, or refuses with exit 8:
+  - A3_LAUNCHER_DIR is set;
+  - run.sh itself is not inside the live repo, i.e. it is running from a launcher snapshot;
+  - the launcher dir passes the same check-approval `--launcher-dir` check.
+  - It then repeats all its own git checks.
+- Recorded in the sealed summary.json: launcher_dir, launcher_sha256, launcher_approved, launcher_reason.
+
+**R8-1**
+- run.sh unsets DEVELOPER_DIR, SDKROOT and every DOCKER_* variable.
+- It pins `DOCKER_HOST=unix://<passwd home>/.docker/run/docker.sock` (or /var/run/docker.sock) with an empty private DOCKER_CONFIG, so caller contexts, plugins and credential helpers aren't used.
+- Recorded: docker_host, docker_server_id (`docker info .ID`), image_ids (`.Id` of both images), and toolchain (`xcode-select -p`).
+- **R8-3 (uniform refusal):** every tampering refusal, in both run.sh and the launcher, now exits **8** with `refused: …`. That includes `git archive` failing on a corrupted object, which used to be exit 5 "STOP".
+
+**Residual risks** (same-user trust, documented):
+- A same-user actor can build their own snapshot and run its run.sh with A3_LAUNCHER_DIR pointing at the real approved launcher dir, skipping the launcher. A3_LAUNCHER_DIR is only a path, so it doesn't attest who the caller was.
+  - Compensating controls: the content still has to be an approved commit (run.sh repeats every git check against A3_REPO), and the evidence records the launcher hash.
+  - A real attestation would need OS-level separation (a separate user account or a signed helper).
+- launcher_sha256 in the evidence is computed by the run.sh that ran, so the evidence still comes from the code under test. It is only meaningful when that run.sh comes from an approved commit, which the launcher enforces.
+- These remain unchanged:
+  - Docker is a trusted computing base;
+  - node_modules is not integrity-checked;
+  - /usr/local/bin and /opt/homebrew/bin are trusted for docker.

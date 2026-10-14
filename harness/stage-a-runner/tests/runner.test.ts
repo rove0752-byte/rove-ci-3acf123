@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -614,12 +614,20 @@ const prodHarness = () => {
   const diff = g('diff', '--numstat', reviewed, 'HEAD').stdout.trim();
   assert.equal(diff, '1\t1\tharness/stage-a-runner/check-approval.py', 'test commit differs from reviewed code by exactly one line');
   writeFileSync(join(fake, 'rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt'), `${head()} r62-test-only\n`, { mode: 0o600 });
-  const go = (extra: Record<string, string> = {}, urls = ['http://allowed.test/a']) => {
+  // R7-4: install the trusted launcher FROM THE CLONE COMMIT into a temp dir (outside git) and approve its manifest
+  // hash in the FAKE APPROVED-LAUNCHERS.txt (next to the fake allowlist). The real lists are never touched.
+  const L = join(h, 'launcher');
+  const inst = spawnSync('zsh', [join(d, 'harness/stage-a-runner/launcher/install.sh'), d, head(), L], { encoding: 'utf8' });
+  assert.equal(inst.status, 0, inst.stdout + inst.stderr); const lsha = inst.stdout.trim(); assert.match(lsha, /^[0-9a-f]{64}$/);
+  writeFileSync(join(fake, 'rove-recovery-evidence/stage-a-runner/APPROVED-LAUNCHERS.txt'), `${lsha} r74-test-only\n`, { mode: 0o600 });
+  const runIn = (cmd: string[], extra: Record<string, string>) => {
     const out = join(mkdtempSync(join(root, 'r62run-')), 'ev');
-    const r = spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), out, '40', ...urls], { env: { ...env, ...PROD, ...extra }, encoding: 'utf8' });
+    const r = spawnSync('zsh', [...cmd.map(c => c === '@OUT' ? out : c)], { env: { ...env, ...PROD, ...extra }, encoding: 'utf8' });
     return { ...r, out, summary: existsSync(join(out, 'summary.json')) ? JSON.parse(readFileSync(join(out, 'summary.json'), 'utf8')) : {} };
   };
-  return { d, g, head, fake, go, done: () => { rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); } };
+  const go = (extra: Record<string, string> = {}, urls = ['http://allowed.test/a'], launcher = L) => runIn([join(launcher, 'a3-launch'), d, '@OUT', '40', ...urls], extra);
+  const direct = (extra: Record<string, string> = {}, script = join(d, 'harness/stage-a-runner/run.sh')) => runIn([script, '@OUT', '40', 'http://allowed.test/a'], extra);
+  return { d, g, head, fake, go, direct, L, lsha, h, done: () => { spawnSync('chmod', ['-R', 'u+w', h]); rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); } };
 };
 test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (fake passwd home, throwaway clone, local fixtures)', opts, () => {
   const before = fileSha(realAllow); const H = prodHarness();
@@ -634,8 +642,11 @@ test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (f
     assert.equal(s.policy_matches_head, true); assert.equal(s.evidence_integrity, true);
     assert.deepEqual(JSON.parse(readFileSync(join(r.out, 'browser/browse.json'), 'utf8')).map((x: any) => x.title), ['Page A']);
     assert.ok(!readFileSync(join(r.out, 'docker-commands.txt'), 'utf8').includes(H.d + '/'), 'live clone never mounted');
+    assert.equal(s.launcher_approved, true); assert.equal(s.launcher_sha256, H.lsha); assert.equal(realpathSync(s.launcher_dir), realpathSync(H.L));
+    assert.match(s.docker_host, /^unix:\/\//); assert.match(s.image_ids['node:24-bookworm-slim'], /^sha256:/); assert.notEqual(s.docker_server_id, 'unknown');
   } finally { H.done(); }
   assert.equal(fileSha(realAllow), before, 'real APPROVED-COMMITS.txt untouched');
+  assert.equal(existsSync(join(dirname(realAllow), 'APPROVED-LAUNCHERS.txt')), false, 'no real launcher list created');
   assert.equal(readFileSync(realAllow, 'utf8').split('\n').filter(l => /^[0-9a-f]{40}/.test(l)).length, 0, 'real allowlist still empty');
 });
 test('R6-1: skip-worktree / assume-unchanged hiding an edit to check-approval.py are refused in production', { timeout: 60_000 }, () => {
@@ -738,4 +749,48 @@ test('R7-2: production ignores the caller\'s PATH and PYTHON* (a PATH python3 sh
     assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /head-not-approved; allowlist .*rove-recovery-evidence\/stage-a-runner\/APPROVED-COMMITS\.txt\)/);
     assert.ok(!r.stdout.includes(fake)); assert.equal(existsSync(marker), false, 'shim python never ran');
   } finally { rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); }
+});
+
+// ---- Round 8 (R7-4 trusted launcher, R8-1) ----
+test('R7-4: production bypassing the launcher is refused (direct live run.sh; live run.sh with a launcher dir; unapproved launcher)', opts, () => {
+  const H = prodHarness();
+  try {
+    let r = H.direct(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /must be started via the trusted launcher/);
+    r = H.direct({ A3_LAUNCHER_DIR: H.L }); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /must run from the launcher's snapshot, not the live tree/);
+    // a self-made snapshot run.sh pointing at a launcher dir that is not approved
+    const snap = join(H.h, 'mysnap'); mkdirSync(snap); spawnSync('sh', ['-c', `git -C "${H.d}" archive HEAD | tar -x -C "${snap}"`]);
+    const bogus = join(H.h, 'bogus-launcher'); mkdirSync(bogus);
+    for (const f of ['a3-launch', 'check-approval.py', 'verify-snapshot.py']) writeFileSync(join(bogus, f), readFileSync(join(H.L, f)) + '\n# changed\n');
+    spawnSync('chmod', ['-R', 'a-w', bogus]);
+    r = H.direct({ A3_LAUNCHER_DIR: bogus, A3_REPO: H.d }, join(snap, 'harness/stage-a-runner/run.sh'));
+    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /launcher not approved \(launcher-not-approved/);
+  } finally { H.done(); }
+});
+test('R7-4: a hostile run.sh (uncommitted or committed-unreviewed) never runs through the launcher', { timeout: 60_000 }, () => {
+  const H = prodHarness();
+  try {
+    const rs = join(H.d, 'harness/stage-a-runner/run.sh'), orig = readFileSync(rs, 'utf8');
+    writeFileSync(rs, orig.replace('set -u', 'set -u\necho HOSTILE-RAN; exit 0'));
+    let r = H.go(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /not clean/); assert.doesNotMatch(r.stdout, /HOSTILE-RAN/);
+    H.g('commit', '-qam', 'hostile run.sh');
+    r = H.go(); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /is not an approved commit \(head-not-approved/); assert.doesNotMatch(r.stdout, /HOSTILE-RAN/);
+  } finally { H.done(); }
+});
+test('R7-4: a tampered or writable launcher refuses itself', { timeout: 60_000 }, () => {
+  const H = prodHarness();
+  try {
+    const t = join(H.h, 'tampered'); spawnSync('cp', ['-R', H.L, t]); spawnSync('chmod', ['-R', 'u+w', t]);
+    appendFileSync(join(t, 'a3-launch'), '\n# tampered\n'); spawnSync('chmod', ['-R', 'a-w', t]);
+    let r = H.go({}, undefined, t); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /launcher not approved \(launcher-not-approved/);
+    const w = join(H.h, 'writable'); spawnSync('cp', ['-R', H.L, w]); spawnSync('chmod', ['u+w', w]);
+    r = H.go({}, undefined, w); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /launcher-writable-or-foreign/);
+  } finally { H.done(); }
+});
+test('R8-1: caller DOCKER_HOST / DOCKER_CONTEXT / DOCKER_CONFIG / DEVELOPER_DIR / SDKROOT are ignored (launcher and run.sh)', opts, () => {
+  const H = prodHarness(); const bad = { DOCKER_HOST: 'tcp://127.0.0.1:1', DOCKER_CONTEXT: 'bogus', DOCKER_CONFIG: '/nonexistent', DEVELOPER_DIR: '/nonexistent', SDKROOT: '/nonexistent' };
+  try {
+    const r = H.go(bad); assert.equal(r.status, 0, r.stdout + r.stderr); assert.equal(r.summary.result, 'completed');
+    assert.match(r.summary.docker_host, /^unix:\/\//); assert.notEqual(r.summary.toolchain, '/nonexistent');
+    const t2 = run('r81-test', 30, [], { CMD: 'true', ...bad }); assert.equal(t2.code, 0, t2.stdout); assert.match(t2.summary.docker_host, /^unix:\/\//);
+  } finally { H.done(); }
 });
