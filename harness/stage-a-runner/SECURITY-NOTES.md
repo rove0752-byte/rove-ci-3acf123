@@ -134,3 +134,63 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
   - Docker is a trusted computing base;
   - node_modules is not integrity-checked;
   - /usr/local/bin and /opt/homebrew/bin are trusted for docker.
+
+## Round 9 changes (builder claims, pending independent review)
+**R9-1: no caller-settable marker; exact environment; no test mode under the launcher**
+- The A3_LAUNCH_CLEAN marker is removed. `a3-launch` always runs in two stages:
+  - **Stage 1** copies the 3 launcher files into a private dir (below), then `exec /usr/bin/env -i` with only PATH (fixed), LANG=C, USER (`id -un`), TMPDIR (the fixed per-user temp dir from `getconf DARWIN_USER_TEMP_DIR`, never the caller's TMPDIR) and, if set, A3_REGISTRY and A3_KILL_LOG. It runs `/bin/zsh -f <copy>/a3-launch --stage2 <origin> …`.
+  - **Stage 2** can be called directly by anyone, so it trusts nothing:
+    - it must be running from a private copy;
+    - the environment variable *names* must be within {PATH, LANG, USER, TMPDIR, A3_REGISTRY, A3_KILL_LOG, PWD, OLDPWD, SHLVL, HOME, LOGNAME, `_`};
+    - PATH, LANG, USER and TMPDIR must equal the fixed values;
+    - otherwise it exits 8 with `refused: unexpected environment variable in launcher: <name>` or `unexpected PATH/LANG/USER/TMPDIR`.
+  - HOME and LOGNAME are allowed only because zsh sets them itself. HOME is then overwritten from getpwuid, and neither is passed on.
+- So STAGE_A_TEST, CMD/PROBE hooks, DEVELOPER_DIR, SDKROOT, GIT_*, PYTHON* and DOCKER_* never reach the launcher's git or python3, or run.sh.
+- run.sh is started with an explicit `env -i` list: PATH, LANG, USER, TMPDIR, HOME, the optional A3_REGISTRY/A3_KILL_LOG, A3_LAUNCHER_DIR, A3_LAUNCHER_ORIGIN, A3_LAUNCHER_SHA256, A3_REPO and A3_LAUNCH_SNAPSHOT_VERIFIED.
+- run.sh additionally refuses (exit 8) **test mode whenever A3_LAUNCHER_DIR is set** (`test mode is not allowed under the launcher`).
+- Tests (R9-1):
+  - the reviewer's forged `A3_LAUNCH_CLEAN=1` with STAGE_A_TEST=1, CMD, DEVELOPER_DIR, SDKROOT and GIT_ALTERNATE_OBJECT_DIRECTORIES through the launcher gives a *production* run (test_mode false, result completed) and the CMD hook never runs;
+  - a direct `--stage2` call with each of STAGE_A_TEST, CMD, DEVELOPER_DIR, SDKROOT, A3_LAUNCH_CLEAN and GIT_DIR, a modified PATH, or a foreign TMPDIR is refused, and its copy is removed;
+  - `--stage2` from the installed dir is refused, and the installed launcher is left intact;
+  - run.sh with A3_LAUNCHER_DIR and STAGE_A_TEST=1 is refused.
+
+**R9-3: hash and run the same bytes (TOCTOU)**
+- Stage 1 copies the files into `<user temp>/rove-a3-lcopy-<pid>-<lstart>.XXXXXX` (dir 0500, a3-launch 0500, the .py files 0400). Stage 2 self-checks and **hashes the copy**, then runs the copy's check-approval.py and verify-snapshot.py. run.sh's launcher gate also checks the copy (A3_LAUNCHER_DIR).
+- The installed origin must also be approved with the same manifest hash (`installed launcher at <origin> not approved or differs from the copy that runs`).
+- Both dirs are recorded in summary.json: launcher_dir is the copy, launcher_origin is the installed dir.
+- Stage 2 proves it is running from a private copy *before* it arms the cleanup trap:
+  - the real path is directly under the fixed user temp dir;
+  - the name matches `rove-a3-lcopy-*`;
+  - it is not a symlink.
+  So every later refusal removes the copy, but a direct call can never delete the installed launcher.
+- Round-9 finding: the first attempt checked the environment before arming the trap, so early refusals leaked six copies. The fix is the ordering above. run.sh's stale-dir sweep now also covers `rove-a3-lcopy-*` (copies left by SIGKILL; the same PID+lstart liveness rule applies).
+- Tests (R9-3):
+  - the copy is a `rove-a3-lcopy-` path, its hash equals the approved hash, and it is gone after the run;
+  - a swapped copy (modified verify-snapshot.py) run as stage 2 against an approved origin is refused `launcher-not-approved`, and the swapped copy is removed.
+- Residual risk: an approved copy can't be modified after hashing by anyone except the same user (dir 0500). A same-user actor could still chmod it during the run. This is the same same-user limit as R9-2.
+
+**Structural residual risks: R9-2 and self-attestation (documented, not fixed)**
+- *R9-2:* the launcher gate in run.sh is advisory against a same-user actor. That actor can `git archive` an approved commit themselves, verify it, and run its run.sh with A3_LAUNCHER_DIR pointing at a real approved launcher (or a copy of one). Every file and env var involved is writable or settable by the same uid, so no in-process check can tell "the launcher ran me" from "someone claimed it did".
+- *Self-attestation:* summary.json, SHA256SUMS and MANIFEST.sealed are written by the run.sh that ran, and verify-evidence.py is run by the same user. The evidence attests only to code that was itself approved; it is not an independent observer.
+- *Compensating controls today:*
+  - the content must still be an approved commit: run.sh repeats every git check, the snapshot is verified object-by-object, and launcher_origin plus both hashes are recorded;
+  - tampering refusals are uniform (exit 8);
+  - Docker and network isolation (`--network none`, proxy over a unix socket) still bound what any run can do;
+  - Jacko alone edits the allowlists;
+  - each round gets an independent review.
+- *What OS-level separation would need (not built):*
+  - a dedicated macOS user (e.g. `_rovea3`) that owns the launcher, both allowlists, the evidence root and, ideally, its own Docker daemon/socket. Jacko's account would have read-only access.
+  - a narrowly scoped entry point (a sudoers rule for exactly `/path/a3-launch` with env_reset, or a launchd daemon with a socket API) that takes only (repo path, commit, urls), does the snapshot and runs as that user;
+  - evidence signed with a key only that user can read, verified by Jacko's account against the public key;
+  - optionally, a code-signed helper or notarised binary so the launcher's identity is checked by the OS, not by itself.
+  - Until that exists, Stage A evidence proves "an approved commit produced this" only under the assumption that Jacko's account is not hostile.
+
+**Residual-risk list (updated)**
+- R9-1: the remaining exposure is an actor who can run arbitrary code as the user. They can still call run.sh directly in test mode (marked `-TEST` and never production), or rebuild a stage-2 environment by hand. That reduces to R9-2.
+- R9-3: same-user chmod or modify of the private copy during a run (see above).
+- R9-2 and self-attestation: structural, as above.
+- Unchanged: Docker is a trusted computing base; node_modules is not integrity-checked; /usr/local/bin and /opt/homebrew/bin are trusted for docker; PID reuse; the main-page heuristic.
+
+**R9-4: staging-path correction**
+- Earlier reports referred to the staging copy loosely. The exact location is `~/rove-recovery-evidence/stage-a-runner/launcher-staging/<short commit>/` (the round-8 copy is `launcher-staging/ae2dd48/`).
+- It is a review copy only. It is not installed in the fixed launcher location, and APPROVED-LAUNCHERS.txt does not exist.

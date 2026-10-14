@@ -75,6 +75,8 @@ if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then echo "refused: ev
 # R7-4: production runs ONLY when started by an approved trusted launcher, from the launcher's verified snapshot.
 LA=("${(@f)$(HOME=$GHOME $PY -I "$TRUSTED/check-approval.py" --launcher-dir "${A3_LAUNCHER_DIR:-/nonexistent}")}")
 L_OK=${LA[1]:-0}; L_SHA=${LA[2]:--}; L_WHY=${LA[3]:-check-failed}
+# R9-1: a launcher-started run can never be a test-mode run.
+[ -n "${A3_LAUNCHER_DIR:-}" ] && [ "$TEST" = 1 ] && { echo "refused: test mode is not allowed under the launcher"; exit 8; }
 if [ "$TEST" != 1 ]; then
   [ -n "${A3_LAUNCHER_DIR:-}" ] || { echo "refused: production must be started via the trusted launcher (a3-launch)"; a3_log "stage-a refuse reason=not-launched"; exit 8; }
   [[ ${SELF:A} != ${WT:A}/* ]] || { echo "refused: run.sh must run from the launcher's snapshot, not the live tree"; exit 8; }
@@ -115,8 +117,8 @@ ID=$(date +%Y%m%d%H%M%S)-$$; F=rove-a3-${ID}1; P=rove-a3-${ID}2; B=rove-a3-${ID}
 START=$(date +%s)
 a3_protect $$
 # Snapshot sweep (R5-4): remove our own stale snapshot dirs (rove-a3-snap-<pid>-<lstart>.*) whose supervisor is dead.
-for sd in ${TMPDIR:-/tmp}/rove-a3-snap-*(N/) ${TMPDIR:-/tmp}/rove-a3-ghome-*(N/); do   # snapshots + private git homes
-  ssup=${${sd:t}#rove-a3-(snap|ghome)-}; ssup=${ssup%.*}
+for sd in ${TMPDIR:-/tmp}/rove-a3-snap-*(N/) ${TMPDIR:-/tmp}/rove-a3-ghome-*(N/) ${TMPDIR:-/tmp}/rove-a3-lcopy-*(N/); do   # snapshots, private git homes, launcher copies
+  ssup=${${sd:t}#rove-a3-(snap|ghome|lcopy)-}; ssup=${ssup%.*}
   [[ $ssup =~ '^[0-9]+-[0-9A-Za-z]+$' ]] && [ -O "$sd" ] && [ ! -L "$sd" ] || continue
   [ "$(a3_lstart ${ssup%%-*} | tr -cd '0-9A-Za-z')" = "${ssup#*-}" ] && continue
   chmod -R u+w "$sd" && rm -rf "$sd" && a3_log "stage-a sweep stale ${${sd:t}[(ws:-:)3]%%.*} $sd"
@@ -212,7 +214,7 @@ docker volume rm $SVOL >/dev/null 2>&1
 left=$(docker ps -aq --filter label=rove.a3.nonce=$NONCE | wc -l | tr -d ' ')
 export SELF OUT
 summary() { # <integrity: pending|true|false> <detail>
-SELF=$RSELF py - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" "$SNAPKIND" "$NM_LOCK_SHA" "$SNAP_VERIFIED" "$SNAP_POLICY_SHA" "${A3_LAUNCHER_DIR:-}" "$L_SHA" "$L_OK" "$L_WHY" "$DOCKER_HOST" "$DOCKER_SERVER_ID" "$IMAGE_IDS" "$TOOLCHAIN" <<'PY'
+SELF=$RSELF py - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" "$SNAPKIND" "$NM_LOCK_SHA" "$SNAP_VERIFIED" "$SNAP_POLICY_SHA" "${A3_LAUNCHER_DIR:-}|${A3_LAUNCHER_ORIGIN:-}" "$L_SHA" "$L_OK" "$L_WHY" "$DOCKER_HOST" "$DOCKER_SERVER_ID" "$IMAGE_IDS" "$TOOLCHAIN" <<'PY'
 import json, sys, os, subprocess
 out, result, peak, left, start, test, psha, pinned, blob, integ, detail, headok, commit = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == '1', sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12] == '1', sys.argv[13]
 pd = os.path.join(out, 'proxy')
@@ -240,7 +242,7 @@ s = {"result": result, "test_mode": test, "evidence_integrity": {"pending": None
      "integrity_checked_after_seal": integ != 'pending', "journal_ok": jok, "scratch_refused": refused, "scratch_copied": len(copy.get('copied', [])),
      "policy_sha256": psha, "policy_pinned_sha256": pinned, "policy_pinned_ok": psha == pinned, "policy_git_blob": blob, "policy_matches_head": headok, "head_commit": commit,
      "commit_approved": sys.argv[14] == '1', "approval_reason": sys.argv[18], "approved_commits_file": sys.argv[15], "approved_commits_sha256": sys.argv[16], "tree_clean": sys.argv[17] == '1', "run_snapshot": sys.argv[19], "node_modules_lock_sha256": sys.argv[20], "snapshot_verified": sys.argv[21], "snapshot_policy_sha256": sys.argv[22],
-     "launcher_dir": sys.argv[23], "launcher_sha256": sys.argv[24], "launcher_approved": sys.argv[25] == '1', "launcher_reason": sys.argv[26],
+     "launcher_dir": sys.argv[23].split('|')[0], "launcher_origin": sys.argv[23].split('|')[1], "launcher_sha256": sys.argv[24], "launcher_approved": sys.argv[25] == '1', "launcher_reason": sys.argv[26],
      "docker_host": sys.argv[27], "docker_server_id": sys.argv[28], "image_ids": dict(x.split('=', 1) for x in sys.argv[29].split()), "toolchain": sys.argv[30],
      "peak_memory_bytes": peak, "containers_left": left, "start_epoch": start, "blocks": pol.get("blocks", {}), "a_class_total": pol.get("aTotal", 0)}
 p = os.path.join(out, 'summary.json')

@@ -642,7 +642,7 @@ test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (f
     assert.equal(s.policy_matches_head, true); assert.equal(s.evidence_integrity, true);
     assert.deepEqual(JSON.parse(readFileSync(join(r.out, 'browser/browse.json'), 'utf8')).map((x: any) => x.title), ['Page A']);
     assert.ok(!readFileSync(join(r.out, 'docker-commands.txt'), 'utf8').includes(H.d + '/'), 'live clone never mounted');
-    assert.equal(s.launcher_approved, true); assert.equal(s.launcher_sha256, H.lsha); assert.equal(realpathSync(s.launcher_dir), realpathSync(H.L));
+    assert.equal(s.launcher_approved, true); assert.equal(s.launcher_sha256, H.lsha); assert.match(s.launcher_dir, /rove-a3-lcopy-/); assert.equal(realpathSync(s.launcher_origin), realpathSync(H.L));   // R9-3: the private copy ran
     assert.match(s.docker_host, /^unix:\/\//); assert.match(s.image_ids['node:24-bookworm-slim'], /^sha256:/); assert.notEqual(s.docker_server_id, 'unknown');
   } finally { H.done(); }
   assert.equal(fileSha(realAllow), before, 'real APPROVED-COMMITS.txt untouched');
@@ -792,5 +792,55 @@ test('R8-1: caller DOCKER_HOST / DOCKER_CONTEXT / DOCKER_CONFIG / DEVELOPER_DIR 
     const r = H.go(bad); assert.equal(r.status, 0, r.stdout + r.stderr); assert.equal(r.summary.result, 'completed');
     assert.match(r.summary.docker_host, /^unix:\/\//); assert.notEqual(r.summary.toolchain, '/nonexistent');
     const t2 = run('r81-test', 30, [], { CMD: 'true', ...bad }); assert.equal(t2.code, 0, t2.stdout); assert.match(t2.summary.docker_host, /^unix:\/\//);
+  } finally { H.done(); }
+});
+
+// ---- Round 9 ----
+test('R9-1: a forged A3_LAUNCH_CLEAN marker with STAGE_A_TEST/CMD/DEVELOPER_DIR cannot reach the launcher or run.sh', opts, () => {
+  const H = prodHarness();
+  try {
+    const r = H.go({ A3_LAUNCH_CLEAN: '1', STAGE_A_TEST: '1', CMD: 'echo HOOK-RAN > /scratch/hook.txt', PROBE: '[]', DEVELOPER_DIR: '/nonexistent', SDKROOT: '/nonexistent', GIT_ALTERNATE_OBJECT_DIRECTORIES: '/nonexistent' });
+    assert.equal(r.status, 0, r.stdout + r.stderr); assert.equal(r.summary.test_mode, false); assert.equal(r.summary.result, 'completed');
+    assert.equal(existsSync(join(r.out, 'browser/hook.txt')), false, 'CMD hook never ran');
+  } finally { H.done(); }
+});
+test('R9-1: calling launcher stage 2 directly with any extra variable, wrong PATH/TMPDIR or from the installed dir is refused, and the copy never leaks', { timeout: 60_000 }, () => {
+  const H = prodHarness();
+  try {
+    const UT = realpathSync(spawnSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' }).stdout.trim() || '/tmp');
+    const clean = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin', LANG: 'C', USER: process.env.USER!, TMPDIR: UT };
+    const copy = () => { const c = mkdtempSync(join(UT, 'rove-a3-lcopy-1-x.')); for (const f of ['a3-launch', 'check-approval.py', 'verify-snapshot.py']) writeFileSync(join(c, f), readFileSync(join(H.L, f))); spawnSync('chmod', ['-R', 'a-w', c]); return c; };
+    const st2 = (envx: Record<string, string>, dir: string) => spawnSync('/usr/bin/env', ['-i', ...Object.entries(envx).map(([k, v]) => `${k}=${v}`), '/bin/zsh', '-f', join(dir, 'a3-launch'), '--stage2', H.L, H.d, join(mkdtempSync(join(root, 'r91-')), 'ev'), '30'], { encoding: 'utf8' });
+    for (const [k, v] of [['STAGE_A_TEST', '1'], ['CMD', 'id'], ['DEVELOPER_DIR', '/nonexistent'], ['SDKROOT', '/x'], ['A3_LAUNCH_CLEAN', '1'], ['GIT_DIR', '/x']]) {
+      const c = copy(); const r = st2({ ...clean, [k]: v }, c);
+      assert.equal(r.status, 8, k + r.stdout); assert.match(r.stdout, new RegExp(`unexpected environment variable in launcher: ${k}`));
+      assert.equal(existsSync(c), false, 'refused copy removed');
+    }
+    for (const bad of [{ PATH: '/tmp:' + clean.PATH }, { TMPDIR: '/tmp' }]) {
+      const c = copy(); const r = st2({ ...clean, ...bad }, c); assert.equal(r.status, 8); assert.match(r.stdout, /unexpected PATH\/LANG\/USER\/TMPDIR/); assert.equal(existsSync(c), false);
+    }
+    const r = st2(clean, H.L); assert.equal(r.status, 8); assert.match(r.stdout, /must run from its private copy/);
+    assert.equal(existsSync(join(H.L, 'a3-launch')), true, 'installed launcher is never deleted');
+  } finally { H.done(); }
+});
+test('R9-1: run.sh refuses test mode when a launcher dir is present', opts, () => {
+  const r = run('r91-testmode', 30, [], { CMD: 'true', A3_LAUNCHER_DIR: '/nonexistent' });
+  assert.equal(r.code, 8); assert.match(r.stdout, /test mode is not allowed under the launcher/);
+});
+test('R9-3: the launcher hashes and runs a private copy; an origin that differs from its copy is refused', opts, () => {
+  const H = prodHarness();
+  try {
+    const r = H.go(); assert.equal(r.status, 0, r.stdout);
+    assert.match(r.summary.launcher_dir, /rove-a3-lcopy-/); assert.equal(r.summary.launcher_sha256, H.lsha);
+    assert.equal(existsSync(r.summary.launcher_dir), false, 'private copy removed after the run');
+    // an attacker-controlled "copy" dir run as stage 2 against an approved origin: copy hash differs -> refused
+    const UT = realpathSync(spawnSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' }).stdout.trim() || '/tmp');
+    const fake = mkdtempSync(join(UT, 'rove-a3-lcopy-1-x.'));
+    for (const f of ['a3-launch', 'check-approval.py', 'verify-snapshot.py']) writeFileSync(join(fake, f), readFileSync(join(H.L, f)) + (f === 'verify-snapshot.py' ? '\n# swapped\n' : ''));
+    spawnSync('chmod', ['-R', 'a-w', fake]);
+    const clean = ['PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin', 'LANG=C', `USER=${process.env.USER}`, `TMPDIR=${UT}`];
+    const x = spawnSync('/usr/bin/env', ['-i', ...clean, '/bin/zsh', '-f', join(fake, 'a3-launch'), '--stage2', H.L, H.d, join(mkdtempSync(join(root, 'r93-')), 'ev'), '30'], { encoding: 'utf8' });
+    assert.equal(x.status, 8, x.stdout); assert.match(x.stdout, /launcher not approved \(launcher-not-approved/);
+    assert.equal(existsSync(fake), false, 'stage 2 removed its (fake) copy');
   } finally { H.done(); }
 });

@@ -5,13 +5,33 @@
 # tree, HEAD in the commit allowlist), extracts `git archive HEAD`, verifies it object-by-object with ITS OWN installed
 # verify-snapshot.py, then runs the SNAPSHOT's run.sh (never the live one) in a scrubbed environment.
 # usage: a3-launch <repo> <new-evidence-dir> <wall-seconds> <url...>      Refusals: exit 8 ("refused: ...").
-if [ -z "${A3_LAUNCH_CLEAN:-}" ]; then   # re-exec with an empty environment (drops GIT_*, PYTHON*, DOCKER_*, DEVELOPER_DIR, SDKROOT, ...)
-  exec /usr/bin/env -i A3_LAUNCH_CLEAN=1 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin LANG=C \
-    USER="$(/usr/bin/id -un)" TMPDIR="${TMPDIR:-/tmp}" ${A3_REGISTRY:+A3_REGISTRY=$A3_REGISTRY} ${A3_KILL_LOG:+A3_KILL_LOG=$A3_KILL_LOG} \
-    /bin/zsh -f "$0" "$@"
+FIXED_PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+UTMP=$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null); UTMP=${${UTMP:-/tmp}:A}   # fixed per-user temp dir, never the caller's TMPDIR
+if [ "${1:-}" != --stage2 ]; then
+  # Stage 1 (R9-1/R9-3): NO caller-settable marker. Copy the installed launcher files to a private temp dir, then ALWAYS
+  # re-exec that private copy with an empty environment. Stage 2 hashes and runs exactly those copies.
+  ORIGIN=${0:A:h}
+  LSUP="$$-$(/bin/ps -o lstart= -p $$ | /usr/bin/sed 's/^ *//;s/ *$//' | /usr/bin/tr -cd '0-9A-Za-z')"   # same pid after exec
+  PRIV=$(/usr/bin/mktemp -d "$UTMP/rove-a3-lcopy-$LSUP.XXXXXX") || exit 8
+  for f in a3-launch check-approval.py verify-snapshot.py; do /bin/cp "$ORIGIN/$f" "$PRIV/$f" || exit 8; done
+  /bin/chmod 0500 "$PRIV/a3-launch"; /bin/chmod 0400 "$PRIV/check-approval.py" "$PRIV/verify-snapshot.py"; /bin/chmod 0500 "$PRIV"
+  exec /usr/bin/env -i PATH=$FIXED_PATH LANG=C USER="$(/usr/bin/id -un)" TMPDIR="$UTMP" \
+    ${A3_REGISTRY:+A3_REGISTRY=$A3_REGISTRY} ${A3_KILL_LOG:+A3_KILL_LOG=$A3_KILL_LOG} \
+    /bin/zsh -f "$PRIV/a3-launch" --stage2 "$ORIGIN" "$@"
 fi
-set -u
+shift; ORIGIN=$1; shift
 LDIR=${0:A:h}
+refuse() { echo "refused: $*"; exit 8; }
+# Stage 2. First prove we are running from a private copy (fixed temp dir, our name pattern, real dir) and only THEN
+# arm the cleanup trap, so every later refusal removes the copy (round-9 leak fix) but a direct --stage2 call from
+# the installed dir can never delete the installed launcher.
+[[ ${LDIR:A} == $UTMP/rove-a3-lcopy-* && ! -L $LDIR && ${LDIR:A:h} == $UTMP ]] || refuse "launcher stage 2 must run from its private copy"
+trap '/bin/chmod -R u+w "$LDIR" 2>/dev/null; /bin/rm -rf "$LDIR"' EXIT
+# R9-1: refuse unless the environment is EXACTLY the expected set (anyone can call --stage2 directly).
+ENVNAMES=(${(f)"$(/usr/bin/env | /usr/bin/sed -n 's/=.*//p' | /usr/bin/sort -u)"})
+for n in $ENVNAMES; do case $n in PATH|LANG|USER|TMPDIR|A3_REGISTRY|A3_KILL_LOG|PWD|OLDPWD|SHLVL|HOME|LOGNAME|_) ;; *) refuse "unexpected environment variable in launcher: $n";; esac; done   # HOME/LOGNAME: zsh itself sets them; HOME is overwritten from passwd below and neither reaches run.sh (child env -i)
+[ "$PATH" = "$FIXED_PATH" ] && [ "$LANG" = C ] && [ "$USER" = "$(/usr/bin/id -un)" ] && [ "${TMPDIR:A}" = "$UTMP" ] || refuse "unexpected PATH/LANG/USER/TMPDIR in launcher"
+set -u
 for c in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do [ -x $c ] && { PY=$c; break; }; done
 for c in /usr/bin/git /opt/homebrew/bin/git /usr/local/bin/git; do [ -x $c ] && { GITBIN=$c; break; }; done
 [ -n "${PY:-}" ] && [ -n "${GITBIN:-}" ] || { echo "refused: python3/git not found in fixed system locations"; exit 8; }
@@ -22,13 +42,15 @@ REPO=${1:A}; shift
 SUP="$$-$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//' | tr -cd '0-9A-Za-z')"
 GH=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-ghome-$SUP.XXXXXX") || exit 8
 SNAP=""
-done_() { [ -n "$SNAP" ] && [ -d "$SNAP" ] && { chmod -R u+w "$SNAP"; rm -rf "$SNAP"; }; rm -rf "$GH"; }
+done_() { [ -n "$SNAP" ] && [ -d "$SNAP" ] && { chmod -R u+w "$SNAP"; rm -rf "$SNAP"; }; rm -rf "$GH"; chmod -R u+w "$LDIR" 2>/dev/null; rm -rf "$LDIR"; }
 trap done_ EXIT
 trap 'exit 130' INT TERM HUP
 g() { HOME=$GH XDG_CONFIG_HOME=$GH $GITBIN --no-replace-objects -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false -C "$REPO" "$@"; }
-refuse() { echo "refused: $*"; exit 8; }
+# R9-3: the PRIVATE copies (what actually runs) are hashed; the installed origin must pass the same check and match.
 SELFCHK=("${(@f)$($PY -I "$LDIR/check-approval.py" --launcher-dir "$LDIR")}")
 [ "${SELFCHK[1]:-0}" = 1 ] || refuse "launcher not approved (${SELFCHK[3]:-?}; manifest ${SELFCHK[2]:--}; list ${SELFCHK[4]:-?})"
+ORIGCHK=("${(@f)$($PY -I "$LDIR/check-approval.py" --launcher-dir "$ORIGIN")}")
+[ "${ORIGCHK[1]:-0}" = 1 ] && [ "${ORIGCHK[2]}" = "${SELFCHK[2]}" ] || refuse "installed launcher at $ORIGIN not approved or differs from the copy that runs (${ORIGCHK[3]:-?})"
 HEAD_COMMIT=$(g rev-parse HEAD 2>/dev/null) || refuse "not a git repo: $REPO"
 GCD=$(g rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
 RW=$( { g for-each-ref --format='%(refname)' refs/replace/ 2>/dev/null; for f in info/grafts objects/info/alternates shallow; do [ -e "$GCD/$f" ] && print "$GCD/$f"; done; } | head -3)
@@ -43,6 +65,8 @@ g archive --format=tar HEAD | tar -x -C "$SNAP" || refuse "snapshot extraction f
 SV=$($PY -I "$LDIR/verify-snapshot.py" "$REPO" "$HEAD_COMMIT" "$SNAP" 2>&1) || refuse "snapshot does not match HEAD tree ($SV)"
 chmod -R a-w "$SNAP"
 [ -f "$SNAP/harness/stage-a-runner/run.sh" ] || refuse "snapshot has no run.sh"
-A3_LAUNCHER_DIR=$LDIR A3_LAUNCHER_SHA256=${SELFCHK[2]} A3_REPO=$REPO A3_LAUNCH_SNAPSHOT_VERIFIED="$SV" \
+# R9-1: run.sh gets an explicit, exact environment (never STAGE_A_TEST, CMD, PROBE or any other test-only variable).
+/usr/bin/env -i PATH=$FIXED_PATH LANG=C USER="$USER" TMPDIR="${TMPDIR:-/tmp}" HOME="$HOME" ${A3_REGISTRY:+A3_REGISTRY=$A3_REGISTRY} ${A3_KILL_LOG:+A3_KILL_LOG=$A3_KILL_LOG} \
+  A3_LAUNCHER_DIR=$LDIR A3_LAUNCHER_ORIGIN=$ORIGIN A3_LAUNCHER_SHA256=${SELFCHK[2]} A3_REPO=$REPO A3_LAUNCH_SNAPSHOT_VERIFIED="$SV" \
   /bin/zsh -f "$SNAP/harness/stage-a-runner/run.sh" "$@"
-exit $?
+RC=$?; exit $RC
