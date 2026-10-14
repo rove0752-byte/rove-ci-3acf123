@@ -42,7 +42,8 @@ umask 077; mkdir -p -m 700 "$OUT" "$OUT/proxy" "$OUT/browser"; chmod 700 "$OUT" 
 # into a private read-only snapshot after the checks; test mode copies the tracked + untracked (non-ignored) working
 # files (so uncommitted test edits still run) unless STAGE_A_TEST_SNAPSHOT=git-archive. node_modules stays a live
 # read-only mount (outside git); its .package-lock.json sha256 is recorded.
-SNAP=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-snap-$$.XXXXXX") || { echo "STOP: snapshot dir"; exit 5; }
+SUP="$$-$(a3_lstart $$ | tr -cd '0-9A-Za-z')"
+SNAP=$(mktemp -d "${TMPDIR:-/tmp}/rove-a3-snap-$SUP.XXXXXX") || { echo "STOP: snapshot dir"; exit 5; }
 if [ "$TEST" != 1 ] || [ "${STAGE_A_TEST_SNAPSHOT:-}" = git-archive ]; then
   git -C "$WT" archive --format=tar HEAD | tar -x -C "$SNAP" && SNAPKIND="git-archive:$HEAD_COMMIT"
 else
@@ -60,7 +61,13 @@ NM_LOCK_SHA=$( [ -f "$NM/.package-lock.json" ] && shasum -a 256 "$NM/.package-lo
 ID=$(date +%Y%m%d%H%M%S)-$$; F=rove-a3-${ID}1; P=rove-a3-${ID}2; B=rove-a3-${ID}3; NONCE=$(a3_nonce); VOL=rove-a3-sock-$ID; SVOL=rove-a3-scratch-$ID
 START=$(date +%s)
 a3_protect $$
-SUP="$$-$(a3_lstart $$ | tr -cd '0-9A-Za-z')"
+# Snapshot sweep (R5-4): remove our own stale snapshot dirs (rove-a3-snap-<pid>-<lstart>.*) whose supervisor is dead.
+for sd in ${TMPDIR:-/tmp}/rove-a3-snap-*(N/); do
+  ssup=${${sd:t}#rove-a3-snap-}; ssup=${ssup%.*}
+  [[ $ssup =~ '^[0-9]+-[0-9A-Za-z]+$' ]] && [ -O "$sd" ] && [ ! -L "$sd" ] || continue
+  [ "$(a3_lstart ${ssup%%-*} | tr -cd '0-9A-Za-z')" = "${ssup#*-}" ] && continue
+  chmod -R u+w "$sd" && rm -rf "$sd" && a3_log "stage-a sweep stale snapshot $sd"
+done
 # Startup sweep (R3-6): remove rove.a3 containers/volumes whose supervisor (pid + start time label) is no longer alive.
 for kindq in "ps -aq" "volume ls -q"; do
   for res in $(docker ${=kindq} --filter label=rove.a3=1 2>/dev/null); do

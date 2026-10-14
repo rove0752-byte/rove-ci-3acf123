@@ -437,6 +437,7 @@ test('R3-6: a SIGKILLed supervisor leaves resources that the next start sweeps',
   assert.notEqual(q('ps') + q('volume'), '', 'SIGKILL leaves something behind (precondition)');
   const r = run('after-kill', 30, ['http://allowed.test/a']);
   assert.match(r.read('supervisor.log') + readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale/);
+  assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale snapshot/, 'R5-4: killed run snapshot swept');
   assert.equal(q('ps'), ''); assert.equal(q('volume'), '');
 });
 test('R3-7: policy.json + policy.sha256 edited together (uncommitted) are refused outside test mode', { timeout: 60_000 }, () => {
@@ -541,13 +542,15 @@ test('R5-4: containers run from a snapshot, not the live tree (git archive exclu
       spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), out, '30'], { env: { ...env, CMD: cmd, ...extra }, encoding: 'utf8' });
       return { m: existsSync(join(out, 'browser/m.txt')) ? readFileSync(join(out, 'browser/m.txt'), 'utf8').trim() : 'missing', s: JSON.parse(readFileSync(join(out, 'summary.json'), 'utf8')), out };
     };
+    const snaps = () => spawnSync('sh', ['-c', `ls -d "\${TMPDIR:-/tmp}"/rove-a3-snap-* 2>/dev/null | wc -l`], { encoding: 'utf8' }).stdout.trim();
+    const before = snaps();
     const a = go({ STAGE_A_TEST_SNAPSHOT: 'git-archive' });
     assert.equal(a.m, '0', 'uncommitted edit NOT visible'); assert.match(a.s.run_snapshot, /^git-archive:[0-9a-f]{40}$/);
     assert.match(a.s.node_modules_lock_sha256, /^[0-9a-f]{64}$/);
     assert.doesNotMatch(readFileSync(join(a.out, 'docker-commands.txt'), 'utf8'), new RegExp(`-v ${d.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[/:]`), 'live tree never mounted');
     const b = go({});
     assert.equal(b.m, '1', 'test-mode worktree copy includes the edit'); assert.equal(b.s.run_snapshot, 'worktree-copy');
-    assert.equal(spawnSync('sh', ['-c', `ls -d "\${TMPDIR:-/tmp}"/rove-a3-snap-* 2>/dev/null | wc -l`], { encoding: 'utf8' }).stdout.trim(), '0', 'snapshots removed');
+    assert.ok(Number(snaps()) <= Number(before), 'this test\'s snapshots removed');
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 test('R4-1: control-character / newline / space filenames are refused (bad-name); final result logged after verification', opts, () => {

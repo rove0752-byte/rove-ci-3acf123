@@ -61,7 +61,7 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
   - run.sh, registry.sh/kill.sh and check-approval.py run from the live tree. A same-user process could still swap them between `git status` and their execution.
   - node_modules is a live read-only mount outside git. Only its `.package-lock.json` hash is recorded; package contents aren't verified.
   - Compensating controls: the whole-tree clean check; head_commit, run_snapshot and node_modules_lock_sha256 recorded in the sealed evidence; an empty allowlist; NO-GO for live mode.
-  - A SIGKILLed supervisor leaves its snapshot dir in $TMPDIR (no secrets; read-only copy of tracked files).
+  - A SIGKILLed supervisor leaves its snapshot dir behind. It is named `rove-a3-snap-<pid>-<lstart>.*` and is removed by the next start's sweep, only when owned by this user, not a symlink, and its supervisor is dead (fix commit after 167f2d5). It holds no secrets; it is a read-only copy of tracked files.
 - Test-suite consequence: production can no longer be run end-to-end by the suite, because the allowlist is fixed and empty and adding entries needs Jacko's approval.
   - Runs default to test mode (results carry `-TEST`).
   - Production is tested on its refusal paths.
