@@ -21,6 +21,34 @@ HEAD_COMMIT=$(git -C "$WT" rev-parse HEAD 2>/dev/null)
 POLICY_HEAD_OK=0; [ -n "$HEAD_BLOB" ] && [ "$POLICY_BLOB" = "$HEAD_BLOB" ] && [ "$HEAD_PIN" = "$PINNED" ] && POLICY_HEAD_OK=1
 if [ "$POLICY_SHA" != "$PINNED" ] && [ "$TEST" != 1 ]; then echo "refused: policy sha256 $POLICY_SHA does not match pinned $PINNED"; a3_log "stage-a refuse reason=policy-hash-mismatch"; exit 8; fi
 if [ "$POLICY_HEAD_OK" != 1 ] && [ "$TEST" != 1 ]; then echo "refused: policy.json/policy.sha256 differ from committed HEAD ($HEAD_COMMIT)"; a3_log "stage-a refuse reason=policy-not-committed"; exit 8; fi
+# R4-2: production mode runs only an APPROVED commit from a clean tree. The allowlist lives outside the repo (and outside
+# every container mount), must be a regular non-symlink file owned by this user and not group/world-writable, and must
+# list HEAD's full 40-hex id exactly. Its path + sha256 are recorded in summary.json.
+APPROVED=${STAGE_A_APPROVED_COMMITS:-$HOME/rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt}
+DIRTY=$(git -C "$WT" status --porcelain --untracked-files=all -- harness .github package.json package-lock.json tsconfig.json 2>&1)
+TREE_CLEAN=0; [ -z "$DIRTY" ] && [ -n "$HEAD_COMMIT" ] && TREE_CLEAN=1
+APPROVAL=$(python3 - "$APPROVED" "$WT" "${HEAD_COMMIT:-none}" <<'PY'
+import os, re, stat, sys, hashlib
+p, wt, head = sys.argv[1], os.path.realpath(sys.argv[2]), sys.argv[3]
+def out(ok, why, sha=''): print(f"{ok} {sha or '-'} {why}"); sys.exit(0)
+try: st = os.lstat(p)
+except OSError: out(0, 'allowlist-missing')
+if not stat.S_ISREG(st.st_mode): out(0, 'allowlist-not-regular')
+rp = os.path.realpath(p)
+if rp == wt or rp.startswith(wt + os.sep): out(0, 'allowlist-inside-repo')
+if st.st_uid != os.getuid() or st.st_mode & 0o022: out(0, 'allowlist-bad-owner-or-mode')
+fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW); data = os.read(fd, 1 << 20); os.close(fd)
+sha = hashlib.sha256(data).hexdigest()
+if not re.fullmatch(r'[0-9a-f]{40}', head): out(0, 'no-head', sha)
+ids = {m.group(1) for l in data.decode('utf-8', 'replace').splitlines() if (m := re.match(r'([0-9a-f]{40})(\s|$)', l))}
+out(1 if head in ids else 0, 'approved' if head in ids else 'head-not-approved', sha)
+PY
+)
+COMMIT_OK=${APPROVAL%% *}; APPROVED_SHA=${${APPROVAL#* }%% *}; APPROVAL_WHY=${APPROVAL##* }
+if [ "$TEST" != 1 ]; then
+  [ "$TREE_CLEAN" = 1 ] || { echo "refused: working tree not clean under harness/ (or no HEAD)"; a3_log "stage-a refuse reason=tree-dirty"; exit 8; }
+  [ "$COMMIT_OK" = 1 ] || { echo "refused: HEAD $HEAD_COMMIT is not an approved commit ($APPROVAL_WHY; allowlist $APPROVED)"; a3_log "stage-a refuse reason=commit-not-approved why=$APPROVAL_WHY head=$HEAD_COMMIT"; exit 8; }
+fi
 if [ "$TEST" = 1 ] && python3 -c 'import json,sys; sys.exit(0 if any(not h.endswith(".test") for h in json.load(open(sys.argv[1]))["allow"]) else 1)' "$POLICY"; then
   echo "refused: test mode with non-.test hosts in the allowlist"; exit 7; fi
 if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then echo "refused: evidence dir $OUT is not empty"; exit 6; fi
@@ -35,6 +63,10 @@ for kindq in "ps -aq" "volume ls -q"; do
   for res in $(docker ${=kindq} --filter label=rove.a3=1 2>/dev/null); do
     if [ "$kindq" = "ps -aq" ]; then sup=$(docker inspect -f '{{index .Config.Labels "rove.a3.sup"}}' $res 2>/dev/null); else sup=$(docker volume inspect -f '{{index .Labels "rove.a3.sup"}}' $res 2>/dev/null); fi
     [ -z "$sup" ] && continue
+    # R4-3: only sweep resources that are unmistakably ours: rove-a3- name, 32-hex nonce label, well-formed sup label.
+    if [ "$kindq" = "ps -aq" ]; then rname=$(docker inspect -f '{{.Name}}' $res 2>/dev/null); rname=${rname#/}; rnonce=$(docker inspect -f '{{index .Config.Labels "rove.a3.nonce"}}' $res 2>/dev/null)
+    else rname=$res; rnonce=$(docker volume inspect -f '{{index .Labels "rove.a3.nonce"}}' $res 2>/dev/null); fi
+    if [[ $rname != rove-a3-* || ! $rnonce =~ '^[0-9a-f]{32}$' || ! $sup =~ '^[0-9]+-[0-9A-Za-z]+$' ]]; then a3_log "stage-a sweep skip-unrecognised ${kindq%% *} $res name=$rname"; continue; fi
     spid=${sup%%-*}; slst=${sup#*-}
     [ "$(a3_lstart $spid | tr -cd '0-9A-Za-z')" = "$slst" ] && continue   # supervisor still alive
     if [ "$kindq" = "ps -aq" ]; then docker kill $res >/dev/null 2>&1; docker rm -f $res >/dev/null 2>&1; else docker volume rm $res >/dev/null 2>&1; fi
@@ -96,22 +128,28 @@ done
 sleep 0.3
 [[ $result == completed ]] && [ ! -f "$A3_REGISTRY/$B" -o ! -f "$A3_REGISTRY/$P" -o ! -f "$A3_REGISTRY/$F" ] && { result="external kill (kill.sh)"; slog "external kill observed"; }
 [ -f "$V" ] && [[ $result == completed ]] && result="auto-terminated: $(<"$V")"
-for n in $B $F $P; do docker kill $n >/dev/null 2>&1; done
+KEEPB=0; [ "$TEST" = 1 ] && [ -n "${STAGE_A_TEST_KEEP_BROWSER:-}" ] && KEEPB=1   # test-only: simulate a browser that survives kill
+for n in $B $F $P; do [ $KEEPB = 1 ] && [ $n = $B ] && continue; docker kill $n >/dev/null 2>&1; done
 for i in {1..30}; do docker inspect $B >/dev/null 2>&1 || break; sleep 0.2; done
-# Copy browser scratch out (R3-1/R3-2/R3-3): trusted copier container, regular files only, caps, 30 s timeout.
 : > "$OUT/scratch-copy.json"
+if docker inspect $B >/dev/null 2>&1; then
+  # R4-4: never copy while the browser could still be writing to scratch.
+  print -r -- '{"error":"browser-still-present"}' > "$OUT/scratch-copy.json"; slog "browser still present after kill -> copy-out aborted"
+else
+# Copy browser scratch out (R3-1/R3-2/R3-3): trusted copier container, regular files only, caps, 30 s timeout.
 docker exec $H node /copyout.mjs > "$OUT/scratch-copy.json" 2>/dev/null &
 CP=$!
 for i in {1..60}; do kill -0 $CP 2>/dev/null || break; sleep 0.5; done
 if kill -0 $CP 2>/dev/null; then kill $CP 2>/dev/null; print -r -- '{"error":"copy-timeout"}' > "$OUT/scratch-copy.json"; slog "scratch copy timed out"; fi
 wait $CP 2>/dev/null
+fi
 cleanup
 wait 2>/dev/null
 docker volume rm $SVOL >/dev/null 2>&1
 left=$(docker ps -aq --filter label=rove.a3.nonce=$NONCE | wc -l | tr -d ' ')
 export SELF OUT
 summary() { # <integrity: pending|true|false> <detail>
-SELF=$SELF python3 - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" <<'PY'
+SELF=$SELF python3 - "$OUT" "$result" $peak $left $START "$TEST" "$POLICY_SHA" "$PINNED" "${POLICY_BLOB:-}" "$1" "$2" "$POLICY_HEAD_OK" "${HEAD_COMMIT:-}" "$COMMIT_OK" "$APPROVED" "$APPROVED_SHA" "$TREE_CLEAN" "$APPROVAL_WHY" <<'PY'
 import json, sys, os, subprocess
 out, result, peak, left, start, test, psha, pinned, blob, integ, detail, headok, commit = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == '1', sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12] == '1', sys.argv[13]
 pd = os.path.join(out, 'proxy')
@@ -138,6 +176,7 @@ if test: result += '-TEST'
 s = {"result": result, "test_mode": test, "evidence_integrity": {"pending": None, "true": True, "false": False}[integ], "integrity_detail": detail,
      "integrity_checked_after_seal": integ != 'pending', "journal_ok": jok, "scratch_refused": refused, "scratch_copied": len(copy.get('copied', [])),
      "policy_sha256": psha, "policy_pinned_sha256": pinned, "policy_pinned_ok": psha == pinned, "policy_git_blob": blob, "policy_matches_head": headok, "head_commit": commit,
+     "commit_approved": sys.argv[14] == '1', "approval_reason": sys.argv[18], "approved_commits_file": sys.argv[15], "approved_commits_sha256": sys.argv[16], "tree_clean": sys.argv[17] == '1',
      "peak_memory_bytes": peak, "containers_left": left, "start_epoch": start, "blocks": pol.get("blocks", {}), "a_class_total": pol.get("aTotal", 0)}
 p = os.path.join(out, 'summary.json')
 if os.path.lexists(p): os.chmod(p, 0o600); os.unlink(p)
@@ -150,7 +189,7 @@ seal() {
   python3 $SELF/verify-evidence.py --seal "$OUT" $NONCE
 }
 result=$(summary pending "")
-slog "result=$result peak_memory_bytes=$peak containers_left=$left"
+slog "provisional result=$result (before integrity verification) peak_memory_bytes=$peak containers_left=$left"
 chmod -R go-rwx "$OUT"
 print -r -- $NONCE > "$OUT/supervisor.nonce"; chmod 400 "$OUT/supervisor.nonce"
 if [ "$TEST" = 1 ] && [ -n "${STAGE_A_TEST_BREAK_SEAL:-}" ]; then mkfifo "$OUT/seal-breaker"; fi   # test-only: sealing must fail
@@ -159,6 +198,7 @@ SEALOUT=$(seal); SEALRC=$?
 if [ $SEALRC -ne 0 ]; then INTEG=false; DETAIL="seal-failed: $SEALOUT"
 else V1=$(python3 $SELF/verify-evidence.py "$OUT"); [ "$V1" = intact ] && { INTEG=true; DETAIL=""; } || { INTEG=false; DETAIL="$V1"; }; fi
 result=$(summary $INTEG "$DETAIL")
+slog "final result=$result evidence_integrity=$INTEG (post-seal verification)"   # R4-1: authoritative line, sealed by the reseal below
 if [ $SEALRC -eq 0 ]; then chmod 600 "$OUT/MANIFEST.sealed"; seal >/dev/null || { INTEG=false; result="evidence-integrity-failure (reseal)"; }; fi
 V2=$(python3 $SELF/verify-evidence.py "$OUT" 2>&1)
 echo "evidence: $V2 (integrity=$INTEG)"

@@ -11,6 +11,8 @@ function walk(dir, depth) {
   for (const name of readdirSync(dir)) {
     const p = join(dir, name), rel = relative(SRC, p);
     if (++entries > MAX_ENTRIES) { report.refused.push({ path: rel, reason: 'too-many-entries' }); return; }
+    // R4-1: names outside [A-Za-z0-9._-]{1,128} (control chars, newlines, spaces, unicode) are refused, never copied.
+    if (!/^[A-Za-z0-9._-]{1,128}$/.test(name) || name === '.' || name === '..') { report.refused.push({ path: JSON.stringify(rel).slice(1, -1).slice(0, 200), reason: 'bad-name' }); continue; }
     const st = lstatSync(p); const k = kind(st);
     if (k === 'dir') { if (depth >= 4) report.refused.push({ path: rel, reason: 'too-deep' }); else { mkdirSync(join(OUT, rel), { mode: 0o700, recursive: true }); walk(p, depth + 1); } continue; }
     if (k !== 'file') { report.refused.push({ path: rel, reason: k }); continue; }

@@ -10,7 +10,10 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(dirname(fileURLToPath(import.meta.url)));
 const root = mkdtempSync(join(process.env.STAGE_A_EVIDENCE_PARENT ?? tmpdir(), 'stage-a-'));
-const env = { ...process.env, A3_REGISTRY: join(root, 'registry'), A3_KILL_LOG: join(root, 'kill.log'), CMD: '', PROBE: '', STAGE_A_TEST: '' };
+// R4-2: production-mode runs need HEAD in an approved-commits allowlist outside the repo; tests use a per-suite temp one.
+const headId = spawnSync('git', ['-C', dirname(dirname(here)), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+const approvedFile = join(root, 'approved-commits.txt'); writeFileSync(approvedFile, `${headId} test-suite\n`, { mode: 0o600 });
+const env = { ...process.env, STAGE_A_APPROVED_COMMITS: approvedFile, A3_REGISTRY: join(root, 'registry'), A3_KILL_LOG: join(root, 'kill.log'), CMD: '', PROBE: '', STAGE_A_TEST: '' };
 const ok = spawnSync('docker', ['image', 'inspect', 'rove-browser-pilot:local', 'node:24-bookworm-slim']).status === 0;
 const opts = { skip: !ok && 'local images not present', timeout: 120_000 };
 type Run = { code: number | null; out: string; started: number; stdout: string; read: (f: string) => string; summary: any; lines: (f: string) => any[]; violation: () => any };
@@ -448,4 +451,85 @@ test('R3-7: policy.json + policy.sha256 edited together (uncommitted) are refuse
     const r = spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), join(d, 'ev'), '30'], { env: { ...env }, encoding: 'utf8' });
     assert.equal(r.status, 8, r.stdout + r.stderr); assert.match(r.stdout, /differ from committed HEAD/);
   } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+// ---- Round 4 ----
+const prodRun = (dir: string, extra: Record<string, string> = {}) => spawnSync('zsh', [join(dir, 'harness/stage-a-runner/run.sh'), join(mkdtempSync(join(tmpdir(), 'r4ev-')), 'ev'), '30'], { env: { ...env, ...extra }, encoding: 'utf8' });
+const scratchClone = () => {
+  const d = mkdtempSync(join(tmpdir(), 'r42-'));
+  const g = (...a: string[]) => spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: d, encoding: 'utf8' });
+  spawnSync('git', ['clone', '-q', '--local', '--no-hardlinks', dirname(dirname(here)), d]);
+  spawnSync('rsync', ['-a', '--exclude', 'node_modules', here + '/', join(d, 'harness/stage-a-runner/')]);
+  g('add', '-A'); g('commit', '-qm', 'snapshot', '--allow-empty');
+  return { d, g, head: () => g('rev-parse', 'HEAD').stdout.trim() };
+};
+test('R4-2: a detached, unreviewed commit with a loosened (re-pinned) policy is refused in production mode', { timeout: 60_000 }, () => {
+  const { d, g, head } = scratchClone(); const allow = join(mkdtempSync(join(tmpdir(), 'r42a-')), 'approved.txt');
+  try {
+    const approved = head(); writeFileSync(allow, `${approved} D-test\n`, { mode: 0o600 });
+    g('checkout', '-q', '--detach');
+    const pj = join(d, 'harness/stage-a-runner/policy.json');
+    const pol = JSON.parse(readFileSync(pj, 'utf8')); pol.allow.push('evil.example'); writeFileSync(pj, JSON.stringify(pol, null, 2));
+    writeFileSync(join(d, 'harness/stage-a-runner/policy.sha256'), spawnSync('shasum', ['-a', '256', pj], { encoding: 'utf8' }).stdout.split(' ')[0] + '\n');
+    g('commit', '-qam', 'loosen policy (unreviewed)');
+    assert.equal(g('branch', '--show-current').stdout.trim(), '', 'detached');
+    assert.notEqual(head(), approved);   // a descendant of an approved commit is still refused (exact-id match, not ancestry)
+    const r = prodRun(d, { STAGE_A_APPROVED_COMMITS: allow });
+    assert.equal(r.status, 8, r.stdout + r.stderr); assert.match(r.stdout, /is not an approved commit \(head-not-approved/);
+  } finally { rmSync(d, { recursive: true, force: true }); rmSync(dirname(allow), { recursive: true, force: true }); }
+});
+test('R4-2: dirty tree, missing / in-repo / symlinked / world-writable allowlists are refused', { timeout: 60_000 }, () => {
+  const { d, head } = scratchClone(); const ad = mkdtempSync(join(tmpdir(), 'r42b-'));
+  try {
+    const good = join(ad, 'ok.txt'); writeFileSync(good, head() + '\n', { mode: 0o600 });
+    const link = join(ad, 'link.txt'); spawnSync('ln', ['-s', good, link]);
+    const ww = join(ad, 'ww.txt'); writeFileSync(ww, head() + '\n'); chmodSync(ww, 0o666);
+    for (const [f, why] of [[join(ad, 'none.txt'), 'allowlist-missing'], [link, 'allowlist-not-regular'], [ww, 'allowlist-bad-owner-or-mode']] as const) {
+      const r = prodRun(d, { STAGE_A_APPROVED_COMMITS: f }); assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, new RegExp(why));
+    }
+    writeFileSync(join(d, '.approved'), head() + '\n', { mode: 0o600 });
+    let r = prodRun(d, { STAGE_A_APPROVED_COMMITS: join(d, '.approved') });
+    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /allowlist-inside-repo/);
+    writeFileSync(join(d, 'harness', 'stray.txt'), 'x');   // untracked file under harness/ = dirty tree
+    r = prodRun(d, { STAGE_A_APPROVED_COMMITS: good });
+    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /not clean/);
+  } finally { rmSync(d, { recursive: true, force: true }); rmSync(ad, { recursive: true, force: true }); }
+});
+test('R4-2: an approved HEAD on a clean tree passes and is recorded', opts, () => {
+  const r = run('approved', 30, ['http://allowed.test/a']);
+  assert.equal(r.code, 0, r.stdout); assert.equal(r.summary.commit_approved, true); assert.equal(r.summary.tree_clean, true);
+  assert.equal(r.summary.head_commit, headId); assert.match(r.summary.approved_commits_sha256, /^[0-9a-f]{64}$/);
+});
+test('R4-1: control-character / newline / space filenames are refused (bad-name); final result logged after verification', opts, () => {
+  const r = testRun('badname', 30, [], `touch "/scratch/a$(printf '\\nresult=completed')" "/scratch/sp ace" /scratch/ok-1.txt`);
+  assert.deepEqual([...new Set(r.summary.scratch_refused.map((x: any) => x.reason))], ['bad-name']);
+  assert.equal(r.summary.scratch_refused.length, 2); assert.equal(r.summary.evidence_integrity, true);
+  assert.match(r.summary.result, /^auto-terminated: scratch-violation bad-name-TEST$/);
+  assert.ok(existsSync(join(r.out, 'browser/ok-1.txt')));
+  const log = r.read('supervisor.log').trim().split('\n');
+  assert.match(log.at(-1)!, /final result=auto-terminated: scratch-violation bad-name-TEST evidence_integrity=true/);
+  assert.equal(log.filter(l => / result=completed/.test(l)).length, 0, 'no injected/stale completed line');
+});
+test('R4-3: the sweep skips rove.a3-labelled resources without the rove-a3- name prefix or a valid nonce', opts, () => {
+  const tag = String(process.pid), dead = '1-DeadSupervisor';
+  const decoys = [[`decoy-r43-${tag}`, 'a'.repeat(32)], [`rove-a3-r43bad-${tag}`, 'not-a-nonce']];
+  try {
+    for (const [n, nonce] of decoys) {
+      assert.equal(spawnSync('docker', ['run', '-d', '--rm', '--pull', 'never', '--network', 'none', '--cap-drop', 'ALL', '--label', 'rove.a3=1', '--label', `rove.a3.nonce=${nonce}`, '--label', `rove.a3.sup=${dead}`, '--name', n, 'node:24-bookworm-slim', 'sleep', '120']).status, 0);
+      assert.equal(spawnSync('docker', ['volume', 'create', '--label', 'rove.a3=1', '--label', `rove.a3.nonce=${nonce}`, '--label', `rove.a3.sup=${dead}`, `${n}-vol`]).status, 0);
+    }
+    const r = run('sweep-guard', 30, ['http://allowed.test/a']);
+    assert.equal(r.code, 0, r.stdout);
+    for (const [n] of decoys) {
+      assert.equal(spawnSync('docker', ['inspect', n]).status, 0, `${n} not swept`);
+      assert.equal(spawnSync('docker', ['volume', 'inspect', `${n}-vol`]).status, 0, `${n}-vol not swept`);
+    }
+    assert.match(readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep skip-unrecognised/);
+  } finally { for (const [n] of decoys) { spawnSync('docker', ['rm', '-f', n]); spawnSync('docker', ['volume', 'rm', `${n}-vol`]); } }  // our own decoys only
+});
+test('R4-4: copy-out is aborted and the run fails if the browser container is still present', opts, () => {
+  const r = run('browser-alive', 4, [], { STAGE_A_TEST: '1', CMD: 'echo x > /scratch/late.txt; sleep 60', STAGE_A_TEST_KEEP_BROWSER: '1' });
+  assert.notEqual(r.code, 0); assert.match(r.summary.result, /^auto-terminated: scratch browser-still-present/);
+  assert.equal(r.summary.scratch_copied, 0); assert.equal(existsSync(join(r.out, 'browser/late.txt')), false);
+  assert.match(r.read('supervisor.log'), /copy-out aborted/); nothingLeft(r);
 });
