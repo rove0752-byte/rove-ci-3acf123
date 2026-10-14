@@ -8,6 +8,9 @@
 # every signal. If the leader has exited, each surviving member must have started at/after the leader's
 # recorded start, otherwise the run is refused (orphan-group-unverifiable).
 # Containers are verified by registry-recorded full ID + creation time + per-run random nonce label.
+# Supervisors register themselves in $A3_PROTECTED (pid + lstart); those are refused even when kill.sh is not a
+# descendant (double-fork + setsid, nohup, disown, cron, launchd). Without that registration, kill.sh only protects
+# its live process ancestry.
 # RESIDUAL RISK (documented): macOS has no pidfd, so a PID can in theory be recycled between the last check
 # and kill(2) (window of a few ms). The registry is trusted local state: any process running as this user,
 # or any user with Docker access, can forge entries or create look-alike containers; this tool protects
@@ -20,6 +23,14 @@ while [ -n "$p" ] && [ "$p" -gt 0 ]; do
   ANC[$p]=1; g=$(ps -o pgid= -p $p 2>/dev/null | tr -d ' '); [ -n "$g" ] && ANC[$g]=1
   [ "$p" = 1 ] && break
   p=$(ps -o ppid= -p $p 2>/dev/null | tr -d ' ')
+done
+# Live protected supervisors: their pid and pgid are refused whatever our ancestry is (N2).
+typeset -A PROT
+for pf in "$A3_PROTECTED"/*(N); do
+  pl=$(<"$pf"); pp=${${pl#pid=}%% *}; pls=${${pl#*lstart=}%%;*}
+  [[ "$pp" =~ '^[0-9]+$' ]] || continue
+  [ "$(ps -o lstart= -p $pp 2>/dev/null | sed 's/^ *//;s/ *$//')" = "$pls" ] || continue
+  PROT[$pp]=1; pg2=$(ps -o pgid= -p $pp 2>/dev/null | tr -d ' '); [ -n "$pg2" ] && PROT[$pg2]=1
 done
 epoch() { local s="${(j: :)${(z)1}}"; date -j -f "%a %b %d %T %Y" "$s" +%s 2>/dev/null || date -d "$s" +%s 2>/dev/null; }
 lst() { ps -o lstart= -p $1 2>/dev/null | sed 's/^ *//;s/ *$//'; }
@@ -47,10 +58,11 @@ stop_pgid() {
   if [[ ! "$pid" =~ '^[0-9]+$' || ! "$pg" =~ '^[0-9]+$' || "$line" != *lstart=*\;* ]]; then refuse $name "reason=malformed-entry" 4; return; fi
   if [ "$pid" -le 1 -o "$pg" -le 1 ]; then refuse $name "pid=$pid pgid=$pg reason=pid1" 4; return; fi
   if (( ${+ANC[$pg]} || ${+ANC[$pid]} )); then refuse $name "pid=$pid pgid=$pg reason=ancestor" 4; return; fi
+  if (( ${+PROT[$pg]} || ${+PROT[$pid]} )); then refuse $name "pid=$pid pgid=$pg reason=protected-supervisor" 4; return; fi
   [ "$pg" != "$pid" ] && { refuse $name "pid=$pid pgid=$pg reason=not-group-leader" 4; return; }
   local t0=$(epoch "$started"); [ -n "$t0" ] || { refuse $name "reason=malformed-entry" 4; return; }
   # A member is ours if it is still in pg, is not an ancestor, and started at/after the leader's recorded start.
-  member_ok() { local m=$1; [ "$(ps -o pgid= -p $m 2>/dev/null | tr -d ' ')" = "$pg" ] && (( ! ${+ANC[$m]} )) && local e=$(epoch "$(lst $m)") && [ -n "$e" ] && (( e >= t0 )); }
+  member_ok() { local m=$1; (( ! ${+PROT[$m]} )) && [ "$(ps -o pgid= -p $m 2>/dev/null | tr -d ' ')" = "$pg" ] && (( ! ${+ANC[$m]} )) && local e=$(epoch "$(lst $m)") && [ -n "$e" ] && (( e >= t0 )); }
   leader_ok() { [ "$(lst $pid)" = "$started" ] && [ "$(ps -o pgid= -p $pid | tr -d ' ')" = "$pg" ] && [[ "$(ps -o stat= -p $pid)" != *s* ]]; }
   local snap=($(members $pg))
   if [ ${#snap} -eq 0 ]; then a3_log "gone name=$name pgid=$pg"; rm -f "$f"; return; fi
@@ -58,6 +70,7 @@ stop_pgid() {
     [ "$(lst $pid)" != "$started" ] && { refuse $name "pid=$pid pgid=$pg reason=start-time-mismatch" 4; return; }
     [[ "$(ps -o stat= -p $pid)" == *s* ]] && { refuse $name "pid=$pid pgid=$pg reason=session-leader" 4; return; }
   fi
+  for m in $snap; do (( ${+PROT[$m]} )) && { refuse $name "pgid=$pg member=$m reason=protected-supervisor" 4; return; }; done
   for m in $snap; do member_ok $m || { refuse $name "pgid=$pg member=$m reason=orphan-group-unverifiable" 4; return; }; done
   a3_log "kill name=$name pgid=$pg members=${(j:,:)snap} leader=$(ps -p $pid >/dev/null 2>&1 && echo alive || echo exited) signal=TERM"
   if ps -p $pid >/dev/null 2>&1; then leader_ok && kill -TERM -- -$pg 2>/dev/null

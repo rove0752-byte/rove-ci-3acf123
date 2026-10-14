@@ -2,14 +2,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, statSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(dirname(fileURLToPath(import.meta.url)));
 const root = mkdtempSync(join(tmpdir(), 'a3-safety-'));
-const env = { ...process.env, A3_REGISTRY: join(root, 'registry'), A3_KILL_LOG: join(root, 'kill.log') };
+const env = { ...process.env, A3_REGISTRY: join(root, 'registry'), A3_KILL_LOG: join(root, 'kill.log'), A3_PROTECTED: join(root, 'protected') };
 const sh = (script: string, args: string[]) => spawnSync('zsh', [join(here, script), ...args], { env, encoding: 'utf8' });
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const pgidOf = (pid: number) => Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim());
@@ -167,4 +167,39 @@ test('M6: a look-alike container (matching name, rove.a3=1 label, real id) with 
   assert.equal(spawnSync('docker', ['ps', '-aq', '--filter', `name=^${name}$`], { encoding: 'utf8' }).stdout.trim(), '');
   writeFileSync(join(env.A3_REGISTRY, 'legacy'), `type=docker container=${name}\n`);
   assert.equal(sh('kill.sh', ['legacy']).status, 4, 'name-only entries are malformed');
+});
+
+// N2: the supervisor S registers itself as protected, is ALSO (maliciously/mistakenly) registered as a target,
+// and launches kill.sh detached so that S is not in kill.sh's ancestry. S must survive in every variant.
+for (const [variant, launch] of [
+  ['double-fork+setsid', `perl -MPOSIX -e 'exit if fork; POSIX::setsid(); exit if fork; exec @ARGV' zsh $K det`],
+  // nohup+disown in the SAME group is already refused as own-pgid; this variant also leaves the group and the tree.
+  ['nohup+disown', `( nohup perl -e 'setpgrp(0,0); select(undef,undef,undef,0.4); exec @ARGV' zsh $K det >/dev/null 2>&1 &! )`],
+  ['setsid-only', `perl -MPOSIX -e 'exit if fork; POSIX::setsid(); exec @ARGV' zsh $K det`],
+] as const) {
+  test(`N2: protected supervisor survives a detached kill.sh (${variant})`, { timeout: 20_000 }, async () => {
+    const reg = join(here, 'registry.sh');
+    const tag = variant.replace(/\W/g, '');
+    const script = `source ${reg}; a3_init; a3_protect $$; print -r -- "type=pgid pid=$$ pgid=$$ lstart=$(a3_lstart $$);" > "$A3_REGISTRY/det"; K=${join(here, 'kill.sh')}; ${launch}; for i in {1..60}; do grep -q 'name=det' "$A3_KILL_LOG" 2>/dev/null && break; sleep 0.1; done; sleep 0.5; echo survived-${tag}; a3_unprotect $$`;
+    const vlog = join(root, `kill-${tag}.log`);
+    const r = spawnSync('perl', ['-e', 'setpgrp(0,0); exec @ARGV', 'zsh', '-c', script], { env: { ...env, A3_KILL_LOG: vlog }, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, new RegExp(`survived-${tag}`));
+    assert.match(readFileSync(vlog, 'utf8'), /refuse name=det .*reason=protected-supervisor/, 'refused by the deny-list, not by ancestry');
+    rmSync(join(env.A3_REGISTRY, 'det'), { force: true });
+  });
+}
+
+test('N2: a protected process inside a target group blocks the kill; a stale protection entry does not', async () => {
+  const pid = Number(sh('spawn.sh', ['grp', join(root, 'g.log'), '--', 'zsh', '-c', 'sleep 30 & echo $! > ' + join(root, 'grp.child') + '; wait']).stdout.trim());
+  await new Promise(res => setTimeout(res, 400));
+  const child = Number(readFileSync(join(root, 'grp.child'), 'utf8'));
+  execFileSync('zsh', ['-c', `source ${join(here, 'registry.sh')}; a3_protect ${child}`], { env });
+  assert.equal(sh('kill.sh', ['grp']).status, 4);
+  assert.match(killLog(), /refuse name=grp .*reason=protected-supervisor/);
+  assert.ok(alive(pid) && alive(child));
+  // make the entry stale (wrong start time): it must be ignored
+  writeFileSync(join(env.A3_PROTECTED, String(child)), `pid=${child} lstart=Thu Jan  1 00:00:00 1970;\n`);
+  assert.equal(sh('kill.sh', ['grp']).status, 0);
+  assert.equal(alive(child), false);
 });

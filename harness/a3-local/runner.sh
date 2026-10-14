@@ -10,6 +10,7 @@ docker image inspect $IMG >/dev/null 2>&1 || { echo "image $IMG not present loca
 mkdir -p -m 700 "$OUT" && chmod 700 "$OUT"
 NAME=rove-a3-$(date +%Y%m%d%H%M%S)-$$
 NONCE=$(a3_nonce)
+a3_protect $$; trap 'a3_unprotect $$' EXIT
 a3_log "start name=$NAME wall=${WALL}s out=$OUT"
 # Foreground --rm run in the background: logs stream to the evidence dir, so nothing is lost when the container is removed.
 docker run --rm --pull never --name $NAME --label rove.a3=1 --label rove.a3.nonce=$NONCE \
