@@ -1,12 +1,13 @@
 // Fixture web server: virtual hosts by Host header. Reachable only from the proxy's upstream network.
 import { createServer } from 'node:http';
 const robots = {
-  'allowed.test': 'User-agent: *\nDisallow: /private\nAllow: /private/public-ok\n\nUser-agent: OtherBot\nDisallow: /\n',
+  'allowed.test': 'User-agent: *\nDisallow: /private\nAllow: /private/public-ok\nDisallow: /search?q=\n\nUser-agent: OtherBot\nDisallow: /\n',
   'other.test': 'User-agent: RoveStageA\nDisallow: /a\n\nUser-agent: *\nDisallow:\n',
 };
 const img = (n, host = 'allowed.test') => Array.from({ length: n }, (_, i) => `<img src="http://${host}/img/${i}.png">`).join('');
 const pages = {
   '/': '<title>Allowed home</title><h1>Home</h1><a href="/a">A</a>',
+  '/search': '<title>Search</title>',
   '/a': '<title>Page A</title><h1>A</h1><p>Read-only fixture.</p>',
   '/offlist': '<title>Off-list subresource</title><img src="http://evil.test/x.png">',
   '/burst': '<title>Burst</title>' + img(20),

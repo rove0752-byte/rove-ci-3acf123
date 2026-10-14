@@ -1,3 +1,5 @@
+# NOTE: this workflow has NEVER run on hosted CI (no push has been made). Its only validation is the
+# local SIMULATION described in harness/a3-local/ci/README.md. Treat it as unverified until a real run exists.
 name: a3-harness-smoke
 on: [pull_request, workflow_dispatch]
 permissions: { contents: read }

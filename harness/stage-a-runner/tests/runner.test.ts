@@ -37,6 +37,8 @@ const nothingLeft = (r: Run) => {
   const all = spawnSync('docker', ['ps', '-a', '--format', '{{.Label "rove.a3.nonce"}}'], { encoding: 'utf8' }).stdout;
   assert.ok(!all.split('\n').some(n => n.startsWith(nonce)), 'no container from this run left');
 };
+// Labels carry the full 32-hex nonce; supervisor.log prints the first 8 — match by prefix (R3-6 scoping).
+const ofRun = (kind: 'ps' | 'volume' | 'network', prefix: string) => spawnSync('docker', [...(kind === 'ps' ? ['ps', '-a'] : [kind, 'ls']), '--filter', 'label=rove.a3=1', '--format', '{{.Label "rove.a3.nonce"}}'], { encoding: 'utf8' }).stdout.split('\n').filter(n => n && n.startsWith(prefix));
 const raw = (host: string, target: string, extra = '') => `GET ${target} HTTP/1.1\r\nHost: ${host}\r\n${extra}Connection: close\r\n\r\n`;
 
 test('positive control: allowed hosts load; logs; limits; --network none browser; evidence 0700/0600; checksums', opts, () => {
@@ -53,8 +55,10 @@ test('positive control: allowed hosts load; logs; limits; --network none browser
   assert.equal(statSync(join(r.out, 'summary.json')).mode & 0o777, 0o600);
   assert.equal(spawnSync('shasum', ['-a', '256', '-c', 'SHA256SUMS'], { cwd: r.out }).status, 0);
   nothingLeft(r);
-  assert.equal(spawnSync('docker', ['network', 'ls', '-q', '--filter', 'label=rove.a3=1'], { encoding: 'utf8' }).stdout.trim(), '', 'L4 networks removed');
-  assert.equal(spawnSync('docker', ['volume', 'ls', '-q', '--filter', 'label=rove.a3=1'], { encoding: 'utf8' }).stdout.trim(), '', 'socket volume removed');
+  const nonce = r.read('supervisor.log').match(/nonce=([0-9a-f]{8})/)![1];   // R3-6: scoped to THIS run
+  assert.deepEqual(ofRun('network', nonce), [], 'no networks from this run');
+  assert.deepEqual(ofRun('volume', nonce), [], 'socket + scratch volumes removed');
+  assert.equal(r.summary.evidence_integrity, true); assert.equal(r.summary.integrity_checked_after_seal, true);
 });
 
 test('H4: a non-empty evidence dir is refused (stale VIOLATION can never be read)', opts, () => {
@@ -245,8 +249,8 @@ test('N5: percent-encoded hostname terminates', opts, () => {
   assert.equal(r.violation().kind, 'encoded-host');
 });
 test('N5: malformed requests are counted (A-class) and reflected in the status', opts, () => {
-  const r = testRun('malformed', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([`GET http://allowed.test/a HTTP/1.1\r\nConnection: close\r\n\r\n`, `GET http://allo\twed.test/ HTTP/1.1\r\nHost: allo\twed.test\r\n\r\n`, `\x00\x01garbage\r\n\r\n`]));
-  assert.ok(r.summary.blocks['malformed-request'] >= 2, JSON.stringify(r.summary.blocks));
+  const r = testRun('malformed', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([`GET http://allo\twed.test/ HTTP/1.1\r\nHost: allo\twed.test\r\n\r\n`, `\x00\x01garbage\r\n\r\n`]));
+  assert.ok(r.summary.blocks['malformed-request'] >= 1, JSON.stringify(r.summary.blocks));
   assert.equal(r.summary.result, 'completed-with-blocks-TEST');
 });
 
@@ -379,3 +383,69 @@ for (const host of ['r5.test', 'rhtml.test']) {
     assert.ok(r.lines('proxy/decisions.jsonl').some(d => d.rule === 'robots-fail-closed'));
   });
 }
+
+// ---- Round 3 ----
+test('R3-1: FIFO / host-symlink / dangling symlink in scratch are refused and logged as a violation; nothing followed', opts, () => {
+  const r = testRun('scratch-evil', 30, [], 'mkfifo /scratch/browse.json; ln -s /etc/passwd /scratch/host; ln -s ../nope /scratch/dangle; echo hi > /scratch/ok.txt');
+  assert.match(r.summary.result, /^auto-terminated: scratch-violation /);
+  const reasons = r.summary.scratch_refused.map((x: any) => `${x.path}:${x.reason}`).sort();
+  assert.deepEqual(reasons, ['browse.json:fifo', 'dangle:symlink', 'host:symlink']);
+  assert.equal(existsSync(join(r.out, 'browser/host')), false); assert.equal(existsSync(join(r.out, 'browser/browse.json')), false);
+  assert.equal(r.read('browser/ok.txt'), 'hi\n');
+  assert.notEqual(r.code, 0); assert.equal(r.summary.evidence_integrity, true); nothingLeft(r);
+});
+test('R3-1: disk fill is bounded by the 64 MiB tmpfs and the per-file cap refuses the file', opts, () => {
+  // dd's own stderr can't be kept in a full /scratch, so the bound is shown by the file size the tmpfs allowed (asked: 200 MiB).
+  const r = testRun('scratch-fill', 40, [], 'dd if=/dev/zero of=/scratch/fill bs=1M count=200; true');
+  const f = r.summary.scratch_refused.find((x: any) => x.path === 'fill');
+  assert.equal(f.reason, 'size-cap'); assert.ok(f.size > 60 * 1024 * 1024 && f.size <= 64 * 1024 * 1024, String(f.size));
+  assert.equal(existsSync(join(r.out, 'browser/fill')), false);
+  assert.match(r.summary.result, /scratch-violation/); nothingLeft(r);
+});
+test('R3-2: a sealing failure fails the run (non-zero exit, integrity false)', opts, () => {
+  const r = run('seal-break', 30, ['http://allowed.test/a'], { STAGE_A_TEST: '1', STAGE_A_TEST_BREAK_SEAL: '1' });
+  assert.equal(r.code, 10, r.stdout); assert.equal(r.summary.evidence_integrity, false);
+  assert.equal(r.summary.integrity_checked_after_seal, true);
+});
+test('R3-4: robots rules match path + query', opts, () => {
+  const r = run('robots-query', 30, ['http://allowed.test/search?q=x', 'http://allowed.test/search?p=1']);
+  assert.equal(r.summary.blocks['robots'], 1, JSON.stringify(r.summary.blocks));
+  assert.ok(r.lines('proxy/requests.jsonl').some((l: any) => l.status === 200 && /search/.test(l.path_raw ?? l.path ?? '')));
+});
+test('R3-5: missing Host header terminates', opts, () => {
+  const r = testRun('host-missing', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([`GET http://allowed.test/a HTTP/1.1\r\nConnection: close\r\n\r\n`]));
+  assert.equal(r.violation().kind, 'host-header-missing');
+});
+test('R3-5: duplicate Host header terminates', opts, () => {
+  const r = testRun('host-dup', 30, [], 'node /runner/tests/probe.mjs', JSON.stringify([raw('allowed.test', 'http://allowed.test/a', 'Host: blocked.test\r\n')]));
+  assert.equal(r.violation().kind, 'host-header-duplicate');
+});
+test('R3-6: a SIGKILLed supervisor leaves resources that the next start sweeps', opts, async () => {
+  const out = join(mkdtempSync(join(root, 'killed-')), 'ev');
+  const p = spawn('zsh', [join(here, 'run.sh'), out, '60'], { env: { ...env, STAGE_A_TEST: '1', CMD: 'sleep 50' }, stdio: 'ignore' });
+  let nonce = '';
+  for (let i = 0; i < 100 && !nonce; i++) { await new Promise(r => setTimeout(r, 300)); nonce = (existsSync(join(out, 'supervisor.log')) ? readFileSync(join(out, 'supervisor.log'), 'utf8') : '').match(/nonce=([0-9a-f]{8})/)?.[1] ?? ''; }
+  assert.ok(nonce);
+  for (let i = 0; i < 50 && ofRun('ps', nonce).length < 4; i++) await new Promise(r => setTimeout(r, 300));
+  p.kill('SIGKILL'); await new Promise(r => p.once('exit', r));   // our own disposable child zsh only
+  const q = (k: 'ps' | 'volume') => ofRun(k, nonce).join(',');
+  assert.notEqual(q('ps') + q('volume'), '', 'SIGKILL leaves something behind (precondition)');
+  const r = run('after-kill', 30, ['http://allowed.test/a']);
+  assert.match(r.read('supervisor.log') + readFileSync(env.A3_KILL_LOG, 'utf8'), /sweep stale/);
+  assert.equal(q('ps'), ''); assert.equal(q('volume'), '');
+});
+test('R3-7: policy.json + policy.sha256 edited together (uncommitted) are refused outside test mode', { timeout: 60_000 }, () => {
+  const wt = dirname(dirname(here)), d = mkdtempSync(join(tmpdir(), 'r37-'));
+  const g = (...a: string[]) => spawnSync('git', a, { cwd: d, encoding: 'utf8' });
+  try {
+    spawnSync('git', ['clone', '-q', '--local', '--no-hardlinks', wt, d]);
+    spawnSync('rsync', ['-a', '--exclude', 'node_modules', here + '/', join(d, 'harness/stage-a-runner/')]);
+    g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qam', 'snapshot', '--allow-empty');
+    const pj = join(d, 'harness/stage-a-runner/policy.json');
+    writeFileSync(pj, readFileSync(pj, 'utf8').replace('"maxRedirects": 10', '"maxRedirects": 11'));
+    const sha = spawnSync('shasum', ['-a', '256', pj], { encoding: 'utf8' }).stdout.split(' ')[0];
+    writeFileSync(join(d, 'harness/stage-a-runner/policy.sha256'), sha + '\n');
+    const r = spawnSync('zsh', [join(d, 'harness/stage-a-runner/run.sh'), join(d, 'ev'), '30'], { env: { ...env }, encoding: 'utf8' });
+    assert.equal(r.status, 8, r.stdout + r.stderr); assert.match(r.stdout, /differ from committed HEAD/);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});

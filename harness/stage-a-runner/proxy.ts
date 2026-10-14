@@ -118,8 +118,12 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   const host = canonHost(url.hostname);
   if (rawAuthority.includes('%')) return terminate('encoded-host', { host: rawAuthority.slice(0, 100), path_raw: '' }), void res.writeHead(400).end();
   if (url.port !== '') return terminate('port', { host, path_raw: '' }, { port: url.port }), void res.writeHead(403).end();
-  if (!req.headers.host) return block('malformed-request', { host, path_raw: '', dest: 'subresource' }, res, 400);
+  // R3-5: Host must be present exactly once (Node's own check is disabled so we can count it).
+  const hostCount = req.rawHeaders.filter((_, i) => i % 2 === 0 && req.rawHeaders[i].toLowerCase() === 'host').length;
+  if (hostCount === 0) return terminate('host-header-missing', { host, path_raw: '' }), void res.writeHead(400).end();
+  if (hostCount > 1) return terminate('host-header-duplicate', { host, path_raw: '' }), void res.writeHead(400).end();
   const rawPath = target.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '').replace(/[?#].*$/, '') || '/';
+  const rawQuery = (target.match(/\?[^#]*/) ?? [''])[0];   // R3-4: RFC 9309 matches path + query
   const isTop = topLevel.has(url.href) || /^text\/html/.test(String(req.headers.accept ?? ''));
   const c: Ctx = { host, path_raw: rawPath, dest: isTop ? 'top-level' : 'subresource' };
   if (url.username || url.password) return terminate('userinfo', c), void res.writeHead(400).end();
@@ -146,7 +150,8 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   const ip = pinned(c); if (!ip) { if (!dead) block('dns-nxdomain', c, res, 502); else { res.writeHead(403); res.end(); } return; }
   if (!(await takeToken(host))) return block('rate', c, res, 429);
   const rules = await robotsFor(host, ip);
-  const decodedHit = disallowed(rules, n.path), rawHit = disallowed(rules, rawPath);
+  let decQuery: string; try { decQuery = rawQuery.split(/%2f/i).map(decodeURIComponent).join('%2F'); } catch { return terminate('encoded-path-decode-failure', c), void res.writeHead(403).end(); }
+  const decodedHit = disallowed(rules, n.path + decQuery), rawHit = disallowed(rules, rawPath + rawQuery);
   if (decodedHit === 'budget' || rawHit === 'budget') return block('robots-match-budget', c, res, 403); // fail closed
   if (decodedHit && !rawHit) return terminate('encoded-path-robots-bypass', c), void res.writeHead(403).end();
   if (decodedHit) {
@@ -179,7 +184,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   }
 }
 
-const server = createServer((req, res) => { handle(req, res).catch(e => { try { res.writeHead(500); res.end(); } catch {} ; log('requests.jsonl', { error: String(e).slice(0, 200) }); }); });
+const server = createServer({ requireHostHeader: false }, (req, res) => { handle(req, res).catch(e => { try { res.writeHead(500); res.end(); } catch {} ; log('requests.jsonl', { error: String(e).slice(0, 200) }); }); });
 server.on('connect', (req, socket) => { terminate('connect-tunnel', { host: String(req.url).slice(0, 200), path_raw: '' }); log('requests.jsonl', { connect: String(req.url).slice(0, 200), status: 405, denied: 'connect-tunnel' }); socket.end('HTTP/1.1 405 Method Not Allowed\r\n\r\n'); });
 server.on('clientError', (e, socket) => { if (!dead) block('malformed-request', { host: '', path_raw: '', dest: 'subresource' }, null, 400); log('requests.jsonl', { status: 400, denied: 'malformed-request', code: (e as any).code }); socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
 try { rmSync(SOCK, { force: true }); } catch {}

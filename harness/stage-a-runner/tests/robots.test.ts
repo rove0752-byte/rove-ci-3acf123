@@ -59,3 +59,9 @@ test('t27u: ambiguous/unsupported robots input fails closed', () => {
   assert.equal(disallowed(robotsFromBytes(Buffer.from('\uFEFFUser-agent: *\nDisallow: /p\n'), UA).rules, '/p'), true, 'BOM stripped');
   assert.equal(disallowed(robotsFromBytes(Buffer.from(''), UA).rules, '/x'), false, 'empty robots = allow (RFC 9309)');
 });
+
+test('R3-4: query strings are part of the match (RFC 9309)', () => {
+  const t = 'User-agent: *\nDisallow: /search?q=\nDisallow: /*?sid=\n';
+  assert.equal(dis(t, '/search?q=x'), true); assert.equal(dis(t, '/search?p=1'), false); assert.equal(dis(t, '/search'), false);
+  assert.equal(dis(t, '/a?sid=1'), true); assert.equal(dis('User-agent: *\nDisallow: /x$\n', '/x?y'), false);
+});
