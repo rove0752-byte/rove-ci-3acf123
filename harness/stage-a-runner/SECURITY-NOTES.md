@@ -29,3 +29,21 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
 - R3-5: Node's built-in Host check is turned off so the proxy can count Host headers itself. A missing or duplicate Host header terminates the run (B-class).
 - R3-6: every container and volume carries `rove.a3.sup=<pid>-<lstart>`. The trap covers INT/TERM/HUP/EXIT. On SIGKILL, the next start sweeps resources whose supervisor (pid + start time) is no longer alive. Test leftover checks are scoped by nonce.
 - R3-7: outside test mode, policy.json's git blob and policy.sha256 must equal the committed HEAD versions, otherwise the run is refused with exit 8.
+
+## Round 4 changes (builder claims, pending independent review)
+- R4-2: production mode (STAGE_A_TEST unset) now refuses unless both of these hold:
+  - The working tree is clean under harness/, .github, package*.json and tsconfig.json (untracked files count as dirty).
+  - HEAD's full 40-hex id is listed exactly in an approved-commits allowlist. Being an ancestor or descendant of a listed commit is not enough.
+- Allowlist location: `~/rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt` by default; `STAGE_A_APPROVED_COMMITS` overrides it.
+  - It must be a regular, non-symlink file owned by the running user, not group- or world-writable, and outside the worktree. No container mounts it.
+  - Its path and sha256, plus commit_approved, approval_reason and tree_clean, go into summary.json.
+  - It was created EMPTY (D-28-4), so production mode currently refuses every commit.
+- R4-1: copy-out refuses any name outside `[A-Za-z0-9._-]{1,128}` (reason `bad-name`), so newlines and control characters can't reach logs or the manifest.
+  - supervisor.log now labels the pre-integrity line `provisional result=`.
+  - The authoritative `final result=… evidence_integrity=…` line is written after post-seal verification and covered by the final reseal.
+- R4-3: the startup sweep deletes only resources that have all of: a `rove-a3-` name, a 32-hex `rove.a3.nonce` label, and a well-formed `rove.a3.sup` label. Anything else is logged as `sweep skip-unrecognised` and left alone.
+- R4-4: if the browser container still exists after kill + wait, copy-out is skipped. scratch-copy.json then records `browser-still-present` and the run fails.
+- Residual risks:
+  - Anyone who can write the allowlist, or set STAGE_A_APPROVED_COMMITS, at the user's own uid can approve a commit. That is the same trust level as Docker access. The control is that the path and sha256 are recorded in every summary.
+  - The sweep still trusts Docker labels. Anyone with Docker access can forge `rove-a3-`-named resources.
+  - Test mode (STAGE_A_TEST=1) skips the approval check by design. Its results are always suffixed `-TEST`.
