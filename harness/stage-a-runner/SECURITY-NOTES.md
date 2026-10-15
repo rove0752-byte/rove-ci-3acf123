@@ -194,3 +194,19 @@ Development only, local fixtures only (D-25-3). A3/live use remains NO-GO (D-25-
 **R9-4: staging-path correction**
 - Earlier reports referred to the staging copy loosely. The exact location is `~/rove-recovery-evidence/stage-a-runner/launcher-staging/<short commit>/` (the round-8 copy is `launcher-staging/ae2dd48/`).
 - It is a review copy only. It is not installed in the fixed launcher location, and APPROVED-LAUNCHERS.txt does not exist.
+
+## M3 hardening (builder claims; independent review in progress, D-41/D-42)
+Commits on m3/hardening: b8a8154 (R10-2), ba1b16d (R7-1b packed test), d44a3be (PATHW), e689644 (NM), 50a7c52 (CI isolation job).
+
+**B2: docker CLI is user-replaceable (ACCEPTED RESIDUAL RISK, D-42)**
+- `/usr/local/bin/docker` is a root-owned symlink to `/Applications/Docker.app/Contents/Resources/bin/docker`. That binary and Docker.app are owned by jacksontaylor:admin, so the same user can replace it.
+- Since d44a3be, run.sh records the docker CLI path, real path and sha256 (plus the python3 and git paths) in summary.json `tools`, which is sealed with the evidence.
+- The hash is recorded, NOT enforced. There's no allowlist and no refusal on mismatch (Jacko, D-42: no enforcement at this stage).
+- Compensating controls: after-the-fact detection from the sealed run record. Docker is already part of the trusted computing base, and the same-user trust residual is unchanged.
+
+**Non-blocking findings (documented, not fixed)**
+- NM check-then-use: node_modules is hashed before the run and then mounted live (read-only into the container, but still writable on the host). A same-user process can change it between the check and its use. There's no re-hash after the run.
+- NM `.cache` skip: the top-level `node_modules/.cache` is excluded from the tree hash, because dev tools (e.g. `.cache/eve`) write there. The runner doesn't load code from it, but it's mounted along with node_modules and isn't integrity-checked. Nested `.cache` dirs are hashed.
+- R10-2 stdout / broken pipe: if the launcher's stdout is a pipe whose reader dies with the launcher, a later write by the orphaned run.sh can get SIGPIPE before it finishes cleanup and sealing. The evidence would then stay unsealed, and leftovers rely on the next start's sweep (the R10-2 test uses `stdio: 'ignore'`, so it doesn't cover this).
+- R10-2 false trigger: `launcher_gone` treats a failing `ps -o ppid=` (empty output) as "launcher gone". A ps failure therefore stops a production run early. That's fail-safe (the run is killed and sealed, never prolonged), but it's a possible spurious termination.
+- Image build: Dockerfile.browser-pilot pins the base image by digest and playwright by version, but the apt packages (iptables, iproute2, nftables, …) and Chromium's `--with-deps` system packages are unpinned. The CI isolation job's image therefore isn't reproducible bit-for-bit.
