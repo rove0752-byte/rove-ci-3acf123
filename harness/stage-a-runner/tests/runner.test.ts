@@ -3,8 +3,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -15,6 +15,12 @@ const root = mkdtempSync(join(process.env.STAGE_A_EVIDENCE_PARENT ?? tmpdir(), '
 // refusal paths (PROD = { STAGE_A_TEST: '' }) and the approval logic is unit-tested via check-approval.py.
 const headId = spawnSync('git', ['-C', dirname(dirname(here)), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
 const PROD = { STAGE_A_TEST: '' };
+// Hosted-CI fix (D-37): check-approval.py's fixed default allowlist lives in the passwd home. On the Mac it exists (empty
+// list) -> 'head-not-approved'; on a fresh hosted runner it is absent -> 'allowlist-missing'. Tests assert the EXACT code for
+// the observed state and only ever READ this path; they never create, edit or remove it.
+const DEFAULT_ALLOWLIST = join(userInfo().homedir, 'rove-recovery-evidence', 'stage-a-runner', 'APPROVED-COMMITS.txt');
+const expectedRefusal = () => existsSync(DEFAULT_ALLOWLIST) ? 'head-not-approved' : 'allowlist-missing';
+const reRefusal = (prefix = '') => new RegExp(`${prefix}${expectedRefusal()}; allowlist ${DEFAULT_ALLOWLIST.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`);
 const env = { ...process.env, A3_REGISTRY: join(root, 'registry'), A3_KILL_LOG: join(root, 'kill.log'), CMD: '', PROBE: '', STAGE_A_TEST: '1' };
 const ok = spawnSync('docker', ['image', 'inspect', 'rove-browser-pilot:local', 'node:24-bookworm-slim']).status === 0;
 const opts = { skip: !ok && 'local images not present', timeout: 120_000 };
@@ -479,7 +485,7 @@ test('R4-2: a detached, unreviewed commit with a loosened (re-pinned) policy is 
     assert.equal(g('branch', '--show-current').stdout.trim(), '', 'detached');
     assert.notEqual(head(), approved);   // a descendant of an approved commit is still refused (exact-id match, not ancestry)
     const r = prodRun(d, { STAGE_A_APPROVED_COMMITS: allow });
-    assert.equal(r.status, 8, r.stdout + r.stderr); assert.match(r.stdout, /is not an approved commit \(head-not-approved/);
+    assert.equal(r.status, 8, r.stdout + r.stderr); assert.match(r.stdout, reRefusal('is not an approved commit \\('));
   } finally { rmSync(d, { recursive: true, force: true }); rmSync(dirname(allow), { recursive: true, force: true }); }
 });
 const approval = (head: string, path: string, wt = dirname(dirname(here))) => spawnSync('python3', [join(here, 'check-approval.py'), head, wt, path], { encoding: 'utf8' }).stdout.split('\n');
@@ -527,7 +533,7 @@ test('R5-2: STAGE_A_APPROVED_COMMITS is ignored in production (fixed default all
     const mine = join(ad, 'mine.txt'); writeFileSync(mine, head() + ' self-approved\n', { mode: 0o600 });
     assert.equal(approval(head(), mine, d)[0], '1', 'the file itself would approve HEAD');
     const r = prodRun(d, { STAGE_A_APPROVED_COMMITS: mine });
-    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /head-not-approved; allowlist .*rove-recovery-evidence\/stage-a-runner\/APPROVED-COMMITS\.txt\)/);
+    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, reRefusal('is not an approved commit \\('));
     assert.doesNotMatch(r.stdout, new RegExp(mine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   } finally { rmSync(d, { recursive: true, force: true }); rmSync(ad, { recursive: true, force: true }); }
 });
@@ -729,6 +735,17 @@ test('R7-1: verify-snapshot re-hashes objects (a substituted loose tree object i
     const tree = g('rev-parse', 'HEAD^{tree}').stdout.trim(), other = g('rev-parse', 'HEAD:harness').stdout.trim();
     // the snapshot commit's root tree and harness/ tree are fresh LOOSE objects in the clone
     const [rp, op] = [tree, other].map(t => join(d, '.git/objects', t.slice(0, 2), t.slice(2)));
+    // Hosted-CI fix (D-37): a full-history checkout is packed, so ALWAYS unpack the SCRATCH clone's packs into loose objects
+    // first (unconditional, so the Mac exercises the same path as the hosted runner).
+    {
+      const pd = join(d, '.git/objects/pack'), held = mkdtempSync(join(tmpdir(), 'r71pack-'));
+      try {
+        for (const f of readdirSync(pd).filter(f => f.endsWith('.pack'))) {
+          renameSync(join(pd, f), join(held, f)); rmSync(join(pd, f.replace(/\.pack$/, '.idx')), { force: true });
+          const u = spawnSync('sh', ['-c', `git -C "${d}" unpack-objects -q < "${join(held, f)}"`], { encoding: 'utf8' }); assert.equal(u.status, 0, u.stderr);
+        }
+      } finally { rmSync(held, { recursive: true, force: true }); }
+    }
     assert.ok(existsSync(rp) && existsSync(op), 'both trees are loose objects (precondition)');
     chmodSync(rp, 0o600); writeFileSync(rp, readFileSync(op));
     const v = spawnSync('python3', [join(here, 'verify-snapshot.py'), d, c, snap], { encoding: 'utf8' });
@@ -746,7 +763,7 @@ test('R7-2: production ignores the caller\'s PATH and PYTHON* (a PATH python3 sh
     writeFileSync(join(shim, 'python3'), `#!/bin/sh\nPYTHONPATH=${JSON.stringify(shim)} exec ${JSON.stringify(realPy)} "$@"\n`, { mode: 0o700 });
     writeFileSync(join(shim, 'git'), '#!/bin/sh\necho shim-git >&2; exit 1\n', { mode: 0o700 });
     const r = prodRun(d, { PATH: `${shim}:${process.env.PATH}`, PYTHONPATH: shim });
-    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, /head-not-approved; allowlist .*rove-recovery-evidence\/stage-a-runner\/APPROVED-COMMITS\.txt\)/);
+    assert.equal(r.status, 8, r.stdout); assert.match(r.stdout, reRefusal('is not an approved commit \\('));
     assert.ok(!r.stdout.includes(fake)); assert.equal(existsSync(marker), false, 'shim python never ran');
   } finally { rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); }
 });
@@ -816,9 +833,12 @@ test('R9-1: calling launcher stage 2 directly with any extra variable, wrong PAT
       assert.equal(r.status, 8, k + r.stdout); assert.match(r.stdout, new RegExp(`unexpected environment variable in launcher: ${k}`));
       assert.equal(existsSync(c), false, 'refused copy removed');
     }
-    for (const bad of [{ PATH: '/tmp:' + clean.PATH }, { TMPDIR: '/tmp' }]) {
+    // Hosted-CI fix (D-37): on Linux the launcher's fixed temp dir IS /tmp, so the wrong TMPDIR must be derived from UT.
+    const wrongTmp = mkdtempSync(join(UT, 'r91-not-the-fixed-dir-')); assert.notEqual(realpathSync(wrongTmp), UT, 'wrong TMPDIR really differs');
+    for (const bad of [{ PATH: '/tmp:' + clean.PATH }, { TMPDIR: wrongTmp }]) {
       const c = copy(); const r = st2({ ...clean, ...bad }, c); assert.equal(r.status, 8); assert.match(r.stdout, /unexpected PATH\/LANG\/USER\/TMPDIR/); assert.equal(existsSync(c), false);
     }
+    rmSync(wrongTmp, { recursive: true, force: true });
     const r = st2(clean, H.L); assert.equal(r.status, 8); assert.match(r.stdout, /must run from its private copy/);
     assert.equal(existsSync(join(H.L, 'a3-launch')), true, 'installed launcher is never deleted');
   } finally { H.done(); }
