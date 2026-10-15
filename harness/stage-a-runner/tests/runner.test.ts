@@ -641,6 +641,7 @@ test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (f
     const r = H.go();
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const s = r.summary, pinned = readFileSync(join(H.d, 'harness/stage-a-runner/policy.sha256'), 'utf8').trim();
+    assert.match(s.tools, /^path=\/usr\/(local\/)?bin\/docker real=\S+ sha256=[0-9a-f]{64} python3=\/usr\/(local\/)?bin\/python3 git=\/usr\/(local\/)?bin\/git$/, 'PATHW: docker CLI real path + sha256 recorded, tools from fixed root dirs');
     assert.equal(s.result, 'completed'); assert.equal(s.test_mode, false);
     assert.equal(s.commit_approved, true); assert.equal(s.approval_reason, 'approved'); assert.ok(s.approved_commits_file.startsWith(H.fake));
     assert.equal(s.tree_clean, true); assert.equal(s.head_commit, H.head()); assert.equal(s.run_snapshot, `git-archive:${H.head()}`);
@@ -849,7 +850,7 @@ test('R9-1: calling launcher stage 2 directly with any extra variable, wrong PAT
   const H = prodHarness();
   try {
     const UT = realpathSync(spawnSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' }).stdout.trim() || '/tmp');
-    const clean = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin', LANG: 'C', USER: process.env.USER!, TMPDIR: UT };
+    const clean = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin', LANG: 'C', USER: process.env.USER!, TMPDIR: UT };
     const copy = () => { const c = mkdtempSync(join(UT, 'rove-a3-lcopy-1-x.')); for (const f of ['a3-launch', 'check-approval.py', 'verify-snapshot.py']) writeFileSync(join(c, f), readFileSync(join(H.L, f))); spawnSync('chmod', ['-R', 'a-w', c]); return c; };
     const st2 = (envx: Record<string, string>, dir: string) => spawnSync('/usr/bin/env', ['-i', ...Object.entries(envx).map(([k, v]) => `${k}=${v}`), '/bin/zsh', '-f', join(dir, 'a3-launch'), '--stage2', H.L, H.d, join(mkdtempSync(join(root, 'r91-')), 'ev'), '30'], { encoding: 'utf8' });
     for (const [k, v] of [['STAGE_A_TEST', '1'], ['CMD', 'id'], ['DEVELOPER_DIR', '/nonexistent'], ['SDKROOT', '/x'], ['A3_LAUNCH_CLEAN', '1'], ['GIT_DIR', '/x']]) {
@@ -870,6 +871,14 @@ test('R9-1: calling launcher stage 2 directly with any extra variable, wrong PAT
 test('R9-1: run.sh refuses test mode when a launcher dir is present', opts, () => {
   const r = run('r91-testmode', 30, [], { CMD: 'true', A3_LAUNCHER_DIR: '/nonexistent' });
   assert.equal(r.code, 8); assert.match(r.stdout, /test mode is not allowed under the launcher/);
+});
+test('PATHW (M3): /opt/homebrew is not on the fixed production PATH or in any tool candidate list', () => {
+  for (const f of ['run.sh', 'launcher/a3-launch', 'launcher/install.sh']) {
+    const code = readFileSync(join(here, f), 'utf8').split('\n').filter(l => !l.trimStart().startsWith('#')).map(l => l.replace(/\s#\s.*$/, '')).join('\n');
+    assert.doesNotMatch(code, /\/opt\/homebrew/, f);
+  }
+  assert.match(readFileSync(join(here, 'launcher/a3-launch'), 'utf8'), /^FIXED_PATH=\/usr\/bin:\/bin:\/usr\/sbin:\/sbin:\/usr\/local\/bin\s/m);
+  assert.match(readFileSync(join(here, 'run.sh'), 'utf8'), /^export PATH=\/usr\/bin:\/bin:\/usr\/sbin:\/sbin:\/usr\/local\/bin$/m);
 });
 test('R10-2: SIGKILL of the launcher stops the run (run.sh notices, kills containers, seals evidence, exits early)', opts, async () => {
   const H = prodHarness(); const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -898,7 +907,7 @@ test('R9-3: the launcher hashes and runs a private copy; an origin that differs 
     const fake = mkdtempSync(join(UT, 'rove-a3-lcopy-1-x.'));
     for (const f of ['a3-launch', 'check-approval.py', 'verify-snapshot.py']) writeFileSync(join(fake, f), readFileSync(join(H.L, f)) + (f === 'verify-snapshot.py' ? '\n# swapped\n' : ''));
     spawnSync('chmod', ['-R', 'a-w', fake]);
-    const clean = ['PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin', 'LANG=C', `USER=${process.env.USER}`, `TMPDIR=${UT}`];
+    const clean = ['PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin', 'LANG=C', `USER=${process.env.USER}`, `TMPDIR=${UT}`];
     const x = spawnSync('/usr/bin/env', ['-i', ...clean, '/bin/zsh', '-f', join(fake, 'a3-launch'), '--stage2', H.L, H.d, join(mkdtempSync(join(root, 'r93-')), 'ev'), '30'], { encoding: 'utf8' });
     assert.equal(x.status, 8, x.stdout); assert.match(x.stdout, /launcher not approved \(launcher-not-approved/);
     assert.equal(existsSync(fake), false, 'stage 2 removed its (fake) copy');

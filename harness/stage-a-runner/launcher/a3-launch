@@ -5,7 +5,7 @@
 # tree, HEAD in the commit allowlist), extracts `git archive HEAD`, verifies it object-by-object with ITS OWN installed
 # verify-snapshot.py, then runs the SNAPSHOT's run.sh (never the live one) in a scrubbed environment.
 # usage: a3-launch <repo> <new-evidence-dir> <wall-seconds> <url...>      Refusals: exit 8 ("refused: ...").
-FIXED_PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+FIXED_PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin   # PATHW (M3): no user-writable /opt/homebrew/bin
 UTMP=$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null); UTMP=${${UTMP:-/tmp}:A}   # fixed per-user temp dir, never the caller's TMPDIR
 if [ "${1:-}" != --stage2 ]; then
   # Stage 1 (R9-1/R9-3): NO caller-settable marker. Copy the installed launcher files to a private temp dir, then ALWAYS
@@ -32,8 +32,8 @@ ENVNAMES=(${(f)"$(/usr/bin/env | /usr/bin/sed -n 's/=.*//p' | /usr/bin/sort -u)"
 for n in $ENVNAMES; do case $n in PATH|LANG|USER|TMPDIR|A3_REGISTRY|A3_KILL_LOG|PWD|OLDPWD|SHLVL|HOME|LOGNAME|_) ;; *) refuse "unexpected environment variable in launcher: $n";; esac; done   # HOME/LOGNAME: zsh itself sets them; HOME is overwritten from passwd below and neither reaches run.sh (child env -i)
 [ "$PATH" = "$FIXED_PATH" ] && [ "$LANG" = C ] && [ "$USER" = "$(/usr/bin/id -un)" ] && [ "${TMPDIR:A}" = "$UTMP" ] || refuse "unexpected PATH/LANG/USER/TMPDIR in launcher"
 set -u
-for c in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do [ -x $c ] && { PY=$c; break; }; done
-for c in /usr/bin/git /opt/homebrew/bin/git /usr/local/bin/git; do [ -x $c ] && { GITBIN=$c; break; }; done
+for c in /usr/bin/python3 /usr/local/bin/python3; do [ -x $c ] && { PY=$c; break; }; done
+for c in /usr/bin/git /usr/local/bin/git; do [ -x $c ] && { GITBIN=$c; break; }; done
 [ -n "${PY:-}" ] && [ -n "${GITBIN:-}" ] || { echo "refused: python3/git not found in fixed system locations"; exit 8; }
 export HOME=$($PY -I -c 'import os,pwd;print(pwd.getpwuid(os.getuid()).pw_dir)')
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 A3_GIT=$GITBIN
