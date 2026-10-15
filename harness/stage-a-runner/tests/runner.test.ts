@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -607,7 +607,9 @@ test('R4-4: copy-out is aborted and the run fails if the browser container is st
 // trusted, reviewed run.sh; approval cannot protect against a hostile launcher.)
 const realAllow = join(spawnSync('python3', ['-c', 'import pwd,os;print(pwd.getpwuid(os.getuid()).pw_dir)'], { encoding: 'utf8' }).stdout.trim(), 'rove-recovery-evidence/stage-a-runner/APPROVED-COMMITS.txt');
 const fileSha = (f: string) => existsSync(f) ? spawnSync('shasum', ['-a', '256', f], { encoding: 'utf8' }).stdout.split(' ')[0] : 'absent';
-const prodHarness = () => {
+const loadCA = (ca = join(here, 'check-approval.py')) => `import sys,importlib.util as u; s=u.spec_from_file_location("ca", ${JSON.stringify(ca)}); m=u.module_from_spec(s); s.loader.exec_module(m)`;
+const nmHash = (dir: string) => { const r = spawnSync('/usr/bin/python3', ['-I', '-c', loadCA() + '; print(m.nm_hash(sys.argv[1]))', dir], { encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
+const prodHarness = (nm: 'approve' | 'wrong' | 'none' = 'approve') => {
   const { d, g, head } = scratchClone();
   const nmLive = join(dirname(dirname(here)), 'node_modules');
   spawnSync('ln', ['-s', spawnSync('readlink', [nmLive], { encoding: 'utf8' }).stdout.trim() || nmLive, join(d, 'node_modules')]);
@@ -626,6 +628,9 @@ const prodHarness = () => {
   const inst = spawnSync('zsh', [join(d, 'harness/stage-a-runner/launcher/install.sh'), d, head(), L], { encoding: 'utf8' });
   assert.equal(inst.status, 0, inst.stdout + inst.stderr); const lsha = inst.stdout.trim(); assert.match(lsha, /^[0-9a-f]{64}$/);
   writeFileSync(join(fake, 'rove-recovery-evidence/stage-a-runner/APPROVED-LAUNCHERS.txt'), `${lsha} r74-test-only\n`, { mode: 0o600 });
+  // M3/NM: approve (in the FAKE list only) the tree hash of the node_modules this clone will mount.
+  const nmh = nmHash(join(d, 'node_modules'));
+  if (nm !== 'none') writeFileSync(join(fake, 'rove-recovery-evidence/stage-a-runner/APPROVED-NODE-MODULES.txt'), `${nm === 'wrong' ? 'f'.repeat(64) : nmh} nm-test-only\n`, { mode: 0o600 });
   const runIn = (cmd: string[], extra: Record<string, string>) => {
     const out = join(mkdtempSync(join(root, 'r62run-')), 'ev');
     const r = spawnSync('zsh', [...cmd.map(c => c === '@OUT' ? out : c)], { env: { ...env, ...PROD, ...extra }, encoding: 'utf8' });
@@ -633,7 +638,7 @@ const prodHarness = () => {
   };
   const go = (extra: Record<string, string> = {}, urls = ['http://allowed.test/a'], launcher = L) => runIn([join(launcher, 'a3-launch'), d, '@OUT', '40', ...urls], extra);
   const direct = (extra: Record<string, string> = {}, script = join(d, 'harness/stage-a-runner/run.sh')) => runIn([script, '@OUT', '40', 'http://allowed.test/a'], extra);
-  return { d, g, head, fake, go, direct, L, lsha, h, done: () => { spawnSync('chmod', ['-R', 'u+w', h]); rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); } };
+  return { d, g, head, fake, go, direct, L, lsha, h, nmh, done: () => { spawnSync('chmod', ['-R', 'u+w', h]); rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); } };
 };
 test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (fake passwd home, throwaway clone, local fixtures)', opts, () => {
   const before = fileSha(realAllow); const H = prodHarness();
@@ -641,6 +646,7 @@ test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (f
     const r = H.go();
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const s = r.summary, pinned = readFileSync(join(H.d, 'harness/stage-a-runner/policy.sha256'), 'utf8').trim();
+    assert.equal(s.node_modules_tree_sha256, H.nmh); assert.equal(s.node_modules_check, 'node-modules-approved');
     assert.match(s.tools, /^path=\/usr\/(local\/)?bin\/docker real=\S+ sha256=[0-9a-f]{64} python3=\/usr\/(local\/)?bin\/python3 git=\/usr\/(local\/)?bin\/git$/, 'PATHW: docker CLI real path + sha256 recorded, tools from fixed root dirs');
     assert.equal(s.result, 'completed'); assert.equal(s.test_mode, false);
     assert.equal(s.commit_approved, true); assert.equal(s.approval_reason, 'approved'); assert.ok(s.approved_commits_file.startsWith(H.fake));
@@ -879,6 +885,34 @@ test('PATHW (M3): /opt/homebrew is not on the fixed production PATH or in any to
   }
   assert.match(readFileSync(join(here, 'launcher/a3-launch'), 'utf8'), /^FIXED_PATH=\/usr\/bin:\/bin:\/usr\/sbin:\/sbin:\/usr\/local\/bin\s/m);
   assert.match(readFileSync(join(here, 'run.sh'), 'utf8'), /^export PATH=\/usr\/bin:\/bin:\/usr\/sbin:\/sbin:\/usr\/local\/bin$/m);
+});
+test('NM (M3): node_modules tree hash detects content, mode, added-file and symlink changes; only top-level .cache is ignored', () => {
+  const t = mkdtempSync(join(tmpdir(), 'nm-')), nm = join(t, 'node_modules'), list = join(t, 'APPROVED-COMMITS.txt');
+  try {
+    mkdirSync(join(nm, 'pkg/lib'), { recursive: true }); writeFileSync(join(nm, 'pkg/package.json'), '{"name":"pkg"}'); writeFileSync(join(nm, 'pkg/lib/i.js'), 'x=1');
+    symlinkSync('../pkg/lib/i.js', join(nm, 'alias.js')); mkdirSync(join(nm, '.cache/eve'), { recursive: true });
+    const chk = () => spawnSync('/usr/bin/python3', ['-I', '-c', loadCA() + `; m.DEFAULT = ${JSON.stringify(list)}; print(m.check_nm(sys.argv[1]))`, nm], { encoding: 'utf8' }).stdout.split('\n');
+    assert.deepEqual(chk().slice(0, 1).concat(chk()[2]), ['0', 'allowlist-missing'], 'no list -> refused');
+    const h0 = nmHash(nm); writeFileSync(join(t, 'APPROVED-NODE-MODULES.txt'), `${h0} t\n`, { mode: 0o600 });
+    assert.deepEqual([chk()[0], chk()[1], chk()[2]], ['1', h0, 'node-modules-approved']);
+    writeFileSync(join(nm, '.cache/eve/x'), 'cache'); assert.equal(nmHash(nm), h0, 'top-level .cache ignored');
+    const changed = (f: () => void, undo: () => void, what: string) => { f(); assert.notEqual(nmHash(nm), h0, what); assert.deepEqual([chk()[0], chk()[2]], ['0', 'node-modules-not-approved'], what); undo(); assert.equal(nmHash(nm), h0, what + ' (undo)'); };
+    changed(() => writeFileSync(join(nm, 'pkg/lib/i.js'), 'x=2'), () => writeFileSync(join(nm, 'pkg/lib/i.js'), 'x=1'), 'content');
+    changed(() => chmodSync(join(nm, 'pkg/lib/i.js'), 0o755), () => chmodSync(join(nm, 'pkg/lib/i.js'), 0o644), 'exec bit');
+    changed(() => writeFileSync(join(nm, 'pkg/lib/evil.js'), ''), () => rmSync(join(nm, 'pkg/lib/evil.js')), 'added file');
+    changed(() => { unlinkSync(join(nm, 'alias.js')); symlinkSync('/etc/passwd', join(nm, 'alias.js')); }, () => { unlinkSync(join(nm, 'alias.js')); symlinkSync('../pkg/lib/i.js', join(nm, 'alias.js')); }, 'symlink target');
+    mkdirSync(join(nm, 'pkg/.cache')); writeFileSync(join(nm, 'pkg/.cache/y'), ''); assert.notEqual(nmHash(nm), h0, 'nested .cache is NOT ignored');
+  } finally { rmSync(t, { recursive: true, force: true }); }
+});
+test('NM (M3): production refuses (exit 8) when node_modules is not approved: list missing, or tree hash not listed', { timeout: 60_000 }, () => {
+  for (const [mode, why] of [['none', 'allowlist-missing'], ['wrong', 'node-modules-not-approved']] as const) {
+    const H = prodHarness(mode);
+    try {
+      const r = H.go(); assert.equal(r.status, 8, r.stdout + r.stderr);
+      assert.match(r.stdout, new RegExp(`refused: node_modules not approved \\(${why}; tree ${H.nmh}; list `));
+      assert.equal(existsSync(join(r.out, 'summary.json')), false, 'refused before any container or evidence');
+    } finally { H.done(); }
+  }
 });
 test('R10-2: SIGKILL of the launcher stops the run (run.sh notices, kills containers, seals evidence, exits early)', opts, async () => {
   const H = prodHarness(); const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
