@@ -82,6 +82,10 @@ if [ "$TEST" != 1 ]; then
   [[ ${SELF:A} != ${WT:A}/* ]] || { echo "refused: run.sh must run from the launcher's snapshot, not the live tree"; exit 8; }
   [ "$L_OK" = 1 ] || { echo "refused: launcher not approved ($L_WHY; manifest $L_SHA; list ${LA[4]:-?})"; a3_log "stage-a refuse reason=launcher-not-approved"; exit 8; }
 fi
+# R10-2: under the launcher, run.sh must not outlive it. The launcher is our parent; if it dies (e.g. SIGKILL), we are
+# re-parented, and the monitor loop below then kills the containers, copies out, seals and exits early.
+LPID=""; [ -n "${A3_LAUNCHER_DIR:-}" ] && LPID=$PPID
+launcher_gone() { [ -n "$LPID" ] || return 1; [ "$(ps -o ppid= -p $$ | tr -d ' ')" != "$LPID" ] || ! kill -0 "$LPID" 2>/dev/null; }
 DOCKER_SERVER_ID=$(docker info --format '{{.ID}}' 2>/dev/null || print unknown)
 IMAGE_IDS=""
 for img in rove-browser-pilot:local node:24-bookworm-slim; do IMAGE_IDS+="$img=$(docker image inspect -f '{{.Id}}' $img 2>/dev/null) "; done
@@ -182,6 +186,7 @@ docker logs -f $B > "$OUT/browser.log" 2>&1 &
 docker logs -f $P > "$OUT/proxy.log" 2>&1 &
 V=$OUT/proxy/VIOLATION
 while :; do
+  if launcher_gone; then result="auto-terminated: launcher gone (R10-2)"; slog "launcher gone -> kill"; break; fi
   if [ ! -f "$A3_REGISTRY/$B" -o ! -f "$A3_REGISTRY/$P" -o ! -f "$A3_REGISTRY/$F" ]; then result="external kill (kill.sh)"; slog "external kill observed"; break; fi
   docker inspect $B >/dev/null 2>&1 || break
   m=$(docker exec $B cat /sys/fs/cgroup/memory.peak 2>/dev/null) && [ -n "$m" ] && (( m > peak )) && peak=$m

@@ -847,6 +847,22 @@ test('R9-1: run.sh refuses test mode when a launcher dir is present', opts, () =
   const r = run('r91-testmode', 30, [], { CMD: 'true', A3_LAUNCHER_DIR: '/nonexistent' });
   assert.equal(r.code, 8); assert.match(r.stdout, /test mode is not allowed under the launcher/);
 });
+test('R10-2: SIGKILL of the launcher stops the run (run.sh notices, kills containers, seals evidence, exits early)', opts, async () => {
+  const H = prodHarness(); const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+  try {
+    const out = join(mkdtempSync(join(root, 'r102-')), 'ev'), sup = join(out, 'supervisor.log');
+    const has = (re: RegExp) => existsSync(sup) && re.test(readFileSync(sup, 'utf8'));
+    const p = spawn('zsh', [join(H.L, 'a3-launch'), H.d, out, '60', 'http://allowed.test/hang'], { env: { ...env, ...PROD }, stdio: 'ignore' });
+    const t0 = Date.now();
+    while (!has(/ started fixture=/)) { assert.ok(Date.now() - t0 < 60_000, 'run started (precondition)'); await sleep(200); }
+    p.kill('SIGKILL'); await new Promise(r => p.once('exit', r));   // our own disposable launcher process only
+    const t1 = Date.now();
+    while (!has(/final result=/)) { assert.ok(Date.now() - t1 < 30_000, 'orphaned run.sh stopped well before the 60 s wall'); await sleep(200); }
+    const s = JSON.parse(readFileSync(join(out, 'summary.json'), 'utf8'));
+    assert.match(s.result, /launcher gone \(R10-2\)/); assert.equal(s.containers_left, 0); assert.equal(s.test_mode, false);
+    assert.match(readFileSync(sup, 'utf8'), /launcher gone -> kill/);
+  } finally { H.done(); }
+});
 test('R9-3: the launcher hashes and runs a private copy; an origin that differs from its copy is refused', opts, () => {
   const H = prodHarness();
   try {
