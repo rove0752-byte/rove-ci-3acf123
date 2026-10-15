@@ -752,6 +752,30 @@ test('R7-1: verify-snapshot re-hashes objects (a substituted loose tree object i
     assert.equal(v.status, 1); assert.match(v.stdout, /mismatch (tree-hash|object-tree)/);
   } finally { rmSync(d, { recursive: true, force: true }); rmSync(snap, { recursive: true, force: true }); }
 });
+test('R7-1b (M3): verify-snapshot detects a substituted object in a PACKED repo (pack-index offset swap)', { timeout: 60_000 }, () => {
+  const { d, g, head } = scratchClone(); const snap = mkdtempSync(join(tmpdir(), 'r71pk-')), VS = join(here, 'verify-snapshot.py');
+  try {
+    const c = head(); spawnSync('sh', ['-c', `git -C "${d}" archive HEAD | tar -x -C "${snap}"`]);
+    assert.equal(g('repack', '-a', '-d', '-q').status, 0); g('prune-packed');
+    const tree = g('rev-parse', 'HEAD^{tree}').stdout.trim(), other = g('rev-parse', 'HEAD:harness').stdout.trim();
+    assert.ok(!existsSync(join(d, '.git/objects', tree.slice(0, 2), tree.slice(2))), 'root tree is packed, not loose (precondition)');
+    assert.match(spawnSync('python3', [VS, d, c, snap], { encoding: 'utf8' }).stdout, /^ok \d+/, 'untampered packed repo verifies');
+    const before = g('cat-file', 'tree', tree).stdout;
+    const pd = join(d, '.git/objects/pack'), idxs = readdirSync(pd).filter(f => f.endsWith('.idx'));
+    assert.equal(idxs.length, 1, 'single pack (precondition)');
+    for (const f of readdirSync(pd)) if (/\.(rev|bitmap)$/.test(f)) rmSync(join(pd, f));
+    const ip = join(pd, idxs[0]); chmodSync(ip, 0o600); const b = readFileSync(ip);
+    assert.equal(b.readUInt32BE(0), 0xff744f63, 'idx v2 magic'); assert.equal(b.readUInt32BE(4), 2, 'idx v2');
+    const n = b.readUInt32BE(8 + 255 * 4), HL = 20, oids = 8 + 256 * 4, offs = oids + n * HL + n * 4;
+    const pos = (id: string) => { for (let i = 0; i < n; i++) if (b.subarray(oids + i * HL, oids + (i + 1) * HL).toString('hex') === id) return i; throw new Error('not in pack ' + id); };
+    const [i, j] = [pos(tree), pos(other)], oi = b.readUInt32BE(offs + i * 4), oj = b.readUInt32BE(offs + j * 4);
+    assert.equal((oi | oj) & 0x80000000, 0, '32-bit offsets (precondition)');
+    b.writeUInt32BE(oj, offs + i * 4); b.writeUInt32BE(oi, offs + j * 4); writeFileSync(ip, b);   // same id -> other tree's bytes
+    assert.notEqual(g('cat-file', 'tree', tree).stdout, before, 'tamper is effective: git now serves different bytes under the id');
+    const v = spawnSync('python3', [VS, d, c, snap], { encoding: 'utf8' });
+    assert.equal(v.status, 1, v.stdout + v.stderr); assert.match(v.stdout, /^mismatch tree-hash /);
+  } finally { rmSync(d, { recursive: true, force: true }); rmSync(snap, { recursive: true, force: true }); }
+});
 test('R7-2: production ignores the caller\'s PATH and PYTHON* (a PATH python3 shim faking pwd is never used)', { timeout: 60_000 }, () => {
   const { d, head } = scratchClone(); const h = mkdtempSync(join(tmpdir(), 'r72-'));
   try {
