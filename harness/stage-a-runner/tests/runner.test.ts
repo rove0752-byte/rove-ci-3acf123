@@ -554,7 +554,13 @@ test('R5-4: containers run from a snapshot, not the live tree (git archive exclu
     const a = go({ STAGE_A_TEST_SNAPSHOT: 'git-archive' });
     assert.equal(a.m, '0', 'uncommitted edit NOT visible'); assert.match(a.s.run_snapshot, /^git-archive:[0-9a-f]{40}$/);
     assert.match(a.s.node_modules_lock_sha256, /^[0-9a-f]{64}$/);
-    assert.doesNotMatch(readFileSync(join(a.out, 'docker-commands.txt'), 'utf8'), new RegExp(`-v ${d.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[/:]`), 'live tree never mounted');
+    // R5-4 fix: in TEST mode run.sh mounts the clone's own policy.json (RPOLICY=$POLICY); that is the ONLY in-clone mount allowed.
+    const mounts = [...readFileSync(join(a.out, 'docker-commands.txt'), 'utf8').matchAll(/-v (\S+)/g)].map(x => x[1]);
+    // run.sh resolves its own dir with zsh :A (realpath), so check both spellings of the clone path (macOS /var -> /private/var).
+    const dr = realpathSync(d), inClone = (m: string) => [d, dr].some(p => m.startsWith(p + '/') || m.startsWith(p + ':'));
+    assert.deepEqual(mounts.filter(inClone), [`${dr}/harness/stage-a-runner/policy.json:/cfg/policy.json:ro`], 'live tree never mounted (only the test-mode policy file)');
+    const srcOf = (dst: string) => mounts.filter(m => m.endsWith(':' + dst)).map(m => m.slice(0, -(dst.length + 1)));
+    for (const dst of ['/app:ro', '/runner:ro']) { const s = srcOf(dst); assert.ok(s.length > 0, `${dst} mounted`); for (const x of s) assert.match(x, /\/rove-a3-snap-[^/]+(\/harness\/stage-a-runner)?$/, `${dst} from snapshot`); }
     const b = go({});
     assert.equal(b.m, '1', 'test-mode worktree copy includes the edit'); assert.equal(b.s.run_snapshot, 'worktree-copy');
     assert.ok(Number(snaps()) <= Number(before), 'this test\'s snapshots removed');
@@ -641,7 +647,8 @@ const prodHarness = (nm: 'approve' | 'wrong' | 'none' = 'approve') => {
   return { d, g, head, fake, go, direct, L, lsha, h, nmh, done: () => { spawnSync('chmod', ['-R', 'u+w', h]); rmSync(d, { recursive: true, force: true }); rmSync(h, { recursive: true, force: true }); } };
 };
 test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (fake passwd home, throwaway clone, local fixtures)', opts, () => {
-  const before = fileSha(realAllow); const H = prodHarness();
+  const realLaunch = join(dirname(realAllow), 'APPROVED-LAUNCHERS.txt');
+  const before = fileSha(realAllow), beforeL = fileSha(realLaunch); const H = prodHarness();
   try {
     const r = H.go();
     assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -659,8 +666,9 @@ test('R6-2: isolated end-to-end PRODUCTION run of an approved commit succeeds (f
     assert.match(s.docker_host, /^unix:\/\//); assert.match(s.image_ids['node:24-bookworm-slim'], /^sha256:/); assert.notEqual(s.docker_server_id, 'unknown');
   } finally { H.done(); }
   assert.equal(fileSha(realAllow), before, 'real APPROVED-COMMITS.txt untouched');
-  assert.equal(existsSync(join(dirname(realAllow), 'APPROVED-LAUNCHERS.txt')), false, 'no real launcher list created');
-  assert.equal(readFileSync(realAllow, 'utf8').split('\n').filter(l => /^[0-9a-f]{40}/.test(l)).length, 0, 'real allowlist still empty');
+  assert.equal(fileSha(realLaunch), beforeL, 'real APPROVED-LAUNCHERS.txt untouched (absent stays absent)');
+  if (before === 'absent') assert.equal(existsSync(realAllow), false, 'real allowlist still absent');
+  else assert.equal(readFileSync(realAllow, 'utf8').split('\n').filter(l => /^[0-9a-f]{40}/.test(l)).length, 0, 'real allowlist still empty');
 });
 test('R6-1: skip-worktree / assume-unchanged hiding an edit to check-approval.py are refused in production', { timeout: 60_000 }, () => {
   const H = prodHarness();
